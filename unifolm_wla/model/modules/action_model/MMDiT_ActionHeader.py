@@ -42,7 +42,10 @@ class ActionEncoder(nn.Module):
 
     def forward(self, actions, timesteps):
         B, T, _ = actions.shape
-        timesteps = timesteps.unsqueeze(1).expand(-1, T)  # [B] -> [B, T]
+        if timesteps.ndim == 1:
+            timesteps = timesteps.unsqueeze(1).expand(-1, T)
+        else:
+            assert timesteps.shape == (B, T)
 
         a_emb = self.layer1(actions)
         tau_emb = self.pos_encoding(timesteps).to(dtype=a_emb.dtype)  # [B, T, w]
@@ -248,6 +251,16 @@ class MMDiTFlowmatchingActionHead(nn.Module):
         t_discretized_action = (t * self.num_timestep_buckets).long()  # (B,)
 
         noisy_actions = (1 - t_b) * noise + t_b * actions_only
+        rtc_loss_mask = None
+        rtc = self.full_config.framework.action_model.get('training_rtc', None)
+        if self.training and rtc is not None and rtc.enabled:
+            from .rtc_training import apply_rtc_prefix
+            assert 0 <= rtc.min_prefix <= rtc.max_prefix < H
+            lengths = torch.randint(rtc.min_prefix, rtc.max_prefix+1, (B,), device=device)
+            enabled = torch.rand(B, device=device) < rtc.probability
+            lengths = torch.where(enabled, lengths, torch.zeros_like(lengths))
+            noisy_actions, step_times, rtc_loss_mask = apply_rtc_prefix(actions_only, noise, t, lengths)
+            t_discretized_action = (step_times * self.num_timestep_buckets).long()
         # Zero the noised input on invalid DOFs so the encoder sees the same thing it
         # sees at inference (predict_action masks `actions` every step). Loss is already
         # mask-weighted, so this only fixes the train/inference input mismatch.
@@ -284,6 +297,8 @@ class MMDiTFlowmatchingActionHead(nn.Module):
         # Loss weight = action-DoF mask.
         weight = mask_part if mask_part.shape[2] > 0 else None
 
+        if rtc_loss_mask is not None:
+            weight = rtc_loss_mask.expand_as(sq_err).to(sq_err.dtype) if weight is None else weight * rtc_loss_mask
         if weight is not None:
             loss = (sq_err * weight).sum() / weight.sum().clamp(min=1)
         else:

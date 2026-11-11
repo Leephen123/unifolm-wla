@@ -85,7 +85,7 @@ def _build_state_tensor(examples: list, device, dtype, training: bool = True) ->
 
     if training:
         batch_size = state.shape[0]
-        rand_vals = torch.rand(batch_size, 1, device=device)
+        rand_vals = torch.rand((batch_size,) + (1,) * (state.ndim-1), device=device)
         is_zero = rand_vals < 0.1
         is_noise = (rand_vals >= 0.1) & (rand_vals < 0.4)
 
@@ -101,7 +101,7 @@ def _build_state_tensor(examples: list, device, dtype, training: bool = True) ->
                 state_mask = torch.where(is_zero, torch.zeros_like(state_mask), state_mask)
 
     if has_mask:
-        state = torch.cat([state, state_mask], dim=1)
+        state = torch.cat([state, state_mask], dim=-1)
 
     return state.unsqueeze(1)
 
@@ -227,6 +227,12 @@ class Qwen_MMDiT(baseframework):
         if not self._use_state_projector:
             return None
         device = self.qwen_vl_interface.model.device
+        if self.config.datasets.vla_data.get('history_frames', 0):
+            examples = [dict(e, state=np.concatenate((e['state_history'], e['state'][None]), axis=0),
+                             state_mask=np.concatenate((e['state_history_mask'], e['state_mask'][None]), axis=0))
+                        for e in examples]
+            state = _build_state_tensor(examples, device, torch.float32, training=self.training)
+            return state.squeeze(1).flatten(0, 1)
         state = _build_state_tensor(examples, device, torch.float32, training=self.training)
         return state.squeeze(1) if state is not None else None
 
@@ -338,7 +344,8 @@ class Qwen_MMDiT(baseframework):
             images=batch_images, instructions=instructions,
             image_roles=[e.get("image_roles") for e in examples],
             arm_types=[e.get("arm_type") for e in examples],
-            add_generation_prompt=False,
+            # Continuous-action training uses solutions=None and includes this header.
+            add_generation_prompt=True,
         )
         backbone_attention_mask = qwen_inputs.get("attention_mask", None)
         if backbone_attention_mask is not None:

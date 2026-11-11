@@ -19,15 +19,13 @@ VIDEO_TOKEN_INDEX = 151656
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_VIDEO_TOKEN = "<video>"
 
-# Prompt-format constants. Source of truth is the offline pretraining data
-# builder (`action_tokenizer/build_vlm_dataset.py`); kept in sync here so the
-# online training prompt matches the pretrained VLM's input distribution.
+# Prompt-format constants. Full-body post-training uses the MOCAP control mode.
 # The two state tokens are emitted as plain text — the pretrained VLM is
 # expected to register them and carry the state projection itself.
 ROBOT_STATE_TOKEN = "<|robot_state|>"
 ROBOT_STATE_IMPLICIT_STATS_TOKEN = "<|robot_state_implicit_stats|>"
 CONTROL_MODE_ARMS_ONLY = "Control Mode: Arms: EE"
-CONTROL_MODE_WITH_LOW = "Control Mode: Arms: EE, LOW BODY: JOINT"
+CONTROL_MODE_WITH_LOW = "Control Mode: Arms: MOCAP, LOW BODY: MOCAP"
 
 
 import torch.nn as nn
@@ -214,7 +212,7 @@ class _QWen3_VL_Interface(nn.Module):
             if num_state_tokens != robot_states.shape[0]:
                 raise ValueError(
                     f"robot state token count ({num_state_tokens}) does not match "
-                    f"robot_states batch ({robot_states.shape[0]}); expected exactly one "
+                    f"robot_states batch ({robot_states.shape[0]}); expected matching flattened state tokens: "
                     f"{ROBOT_STATE_TOKEN!r} per sample."
                 )
             proj_param = next(projector.parameters())
@@ -259,7 +257,7 @@ class _QWen3_VL_Interface(nn.Module):
             cam_wrist_left: <image>
             Task: <instruction>
             State: <|robot_state_implicit_stats|><|robot_state|>
-            Control Mode: Arms: EE, LOW BODY: JOINT
+            Control Mode: Arms: MOCAP, LOW BODY: MOCAP
 
         ``Control Mode`` includes the LOW BODY line only when the per-sample
         ``arm_type`` is ``dual_with_legs``. When ``image_roles`` is None the legacy
@@ -290,7 +288,7 @@ class _QWen3_VL_Interface(nn.Module):
                 control_mode = (
                     CONTROL_MODE_WITH_LOW if arm_type == "dual_with_legs" else CONTROL_MODE_ARMS_ONLY
                 )
-                state_block = ROBOT_STATE_IMPLICIT_STATS_TOKEN + ROBOT_STATE_TOKEN
+                state_block = ROBOT_STATE_IMPLICIT_STATS_TOKEN + ROBOT_STATE_TOKEN * (1 + int(self.config.datasets.vla_data.get("history_frames", 0)))
                 lead = "\n" if content else ""
                 trailing = (
                     f"{lead}Task: {instruction}\n"
@@ -319,20 +317,17 @@ class _QWen3_VL_Interface(nn.Module):
         # (no solutions) the default is to keep the trailing generation prompt so
         # an autoregressive decoder knows to start emitting.
         #
-        # `add_generation_prompt` lets the caller override this. For the QwenGR00T
-        # framework the VLM is used purely as an encoder for the DiT head (no
-        # autoregressive generation), so `predict_action` forces this to False:
-        # the trailing `<|im_start|>assistant\n` would otherwise enter the DiT
-        # cross-attention keys, yet during training that exact header lived inside
-        # `assistant_mask` and was masked OUT of the DiT keys. Dropping it makes
-        # the inference encoder context end at `Control Mode: ...<|im_end|>`,
-        # exactly matching the training DiT key set.
+        # QwenMMDiT continuous-action training uses solutions=None. Its inference
+        # path also keeps this fixed assistant header so both prefixes match.
         if add_generation_prompt is None:
             add_generation_prompt = solutions is None
 
+        processor_kwargs = {"padding": True, "return_tensors": "pt"}
+        if self.config.datasets.vla_data.get('text_max_length', 0):
+            processor_kwargs.update(padding='max_length', max_length=int(self.config.datasets.vla_data.text_max_length), truncation=False)
         batch_inputs = self.processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=add_generation_prompt, return_dict=True,
-            processor_kwargs={"padding": True, "return_tensors": "pt"},
+            processor_kwargs=processor_kwargs,
         )
 
         # if solutions, build (a) the LM-CE labels and (b) the DiT keys-mask.

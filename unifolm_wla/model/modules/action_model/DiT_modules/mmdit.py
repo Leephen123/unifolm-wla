@@ -582,14 +582,16 @@ class DiT(ModelMixin, ConfigMixin):
 
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                txt_temb=txt_temb,
-                image_rotary_emb=image_rotary_emb,
-                attention_mask=attention_mask,
-            )
+            block_kwargs = dict(encoder_hidden_states=encoder_hidden_states,
+                                temb=temb, txt_temb=txt_temb,
+                                image_rotary_emb=image_rotary_emb,
+                                attention_mask=attention_mask)
+            if self.training and self.gradient_checkpointing:
+                from torch.utils.checkpoint import checkpoint
+                encoder_hidden_states, hidden_states = checkpoint(
+                    block, hidden_states, use_reentrant=False, **block_kwargs)
+            else:
+                encoder_hidden_states, hidden_states = block(hidden_states, **block_kwargs)
             all_hidden_states.append(hidden_states)
 
         # Output processing. The final AdaLN modulates the ACTION stream, so it is
