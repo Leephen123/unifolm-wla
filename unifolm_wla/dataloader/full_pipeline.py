@@ -83,10 +83,36 @@ def read_frame(path, index):
     raise IndexError((path, index))
 
 
+DEFAULT_BACKGROUND_RECOLOR_PROBABILITY = 0.5
+
+
+def _recolor_probability(value):
+    probability = float(value)
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("background_recolor_probability must be between 0 and 1.")
+    return probability
+
+
+def resolve_training_data(data):
+    probability = _recolor_probability(
+        data.get("background_recolor_probability", DEFAULT_BACKGROUND_RECOLOR_PROBABILITY)
+    )
+    if data.get("background_recolor", False) and probability > 0:
+        return Path(data.get("background_recolor_manifest_path") or data.manifest_path), probability
+    return Path(data.manifest_path), 0.0
+
+
 class FullPipelineDataset(Dataset):
-    def __init__(self, manifest_path, statistics_path, history_frames=0):
+    def __init__(self, manifest_path, statistics_path, history_frames=0, *,
+                 background_recolor=False, prompt_mode=None,
+                 background_recolor_probability=DEFAULT_BACKGROUND_RECOLOR_PROBABILITY):
         manifest = json.loads(Path(manifest_path).read_text())
         self.episodes = manifest["episodes"]
+        probability = _recolor_probability(background_recolor_probability)
+        self.background_recolor_probability = probability if background_recolor else 0.0
+        self.prompt_mode = prompt_mode
+        if self.background_recolor_probability > 0 and any("background_masks_parquet" not in e for e in self.episodes):
+            raise ValueError("background_recolor requires background_masks_parquet for every episode.")
         self.history_frames = int(history_frames)
         assert self.history_frames in (0, 50)
         self.prompt = manifest["prompt"]
@@ -113,8 +139,12 @@ class FullPipelineDataset(Dataset):
         action = np.concatenate((z["arm_actions"][indices], z["hand_actions"][indices]), axis=-1)
         action = ((action - self.ao) / self.asc).astype(np.float32)
         assert action.shape == (50, 114) and np.isfinite(action).all()
-        images = [pad_resize(read_frame(entry["videos"][key], row))
-                  for key, role in CAMERAS]
+        images = [read_frame(entry["videos"][key], row) for key, _ in CAMERAS]
+        probability = self.background_recolor_probability
+        if probability == 1.0 or (probability > 0 and np.random.random() < probability):
+            from .background_recolor import recolor_front_head
+            images[0] = recolor_front_head(images[0], entry["background_masks_parquet"], row)
+        images = [pad_resize(image) for image in images]
         example = {"image": images, "image_roles": [role for key, role in CAMERAS],
                 "lang": self.prompt, "state": state, "state_mask": state_mask,
                 "action": action, "action_mask": np.ones(114, dtype=bool),
@@ -125,7 +155,7 @@ class FullPipelineDataset(Dataset):
             history_centers = z['centers'][rows]
             raw = np.concatenate((z['arm_state'][history_centers], z['hand_state'][history_centers]), axis=-1)
             example['state_history'], example['state_history_mask'] = pack_history(raw, valid, self.so, self.ss)
-            draw = np.random.random()
+            draw = 0.0 if self.prompt_mode == 'full_only' else np.random.random()
             if draw < .5:
                 source, prompt = 'full', self.prompt
             elif draw < .75:
@@ -149,7 +179,13 @@ def collate_examples(batch):
 def build_full_pipeline_dataloader(cfg):
     data = cfg.datasets.vla_data
     assert list(data.image_size_wh) == [448, 320]
-    dataset = FullPipelineDataset(data.manifest_path, data.statistics_path, data.get("history_frames", 0))
+    manifest, probability = resolve_training_data(data)
+    dataset = FullPipelineDataset(
+        manifest, data.statistics_path, data.get("history_frames", 0),
+        background_recolor=probability > 0,
+        background_recolor_probability=probability,
+        prompt_mode=data.get("prompt_mode"),
+    )
     # Accelerate shards the ordinary dataloader exactly once across ranks.
     return DataLoader(dataset, batch_size=data.per_device_batch_size, shuffle=True,
                       num_workers=data.num_workers, collate_fn=collate_examples,
