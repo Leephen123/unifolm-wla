@@ -49,6 +49,49 @@ def load_body(path):
         return {k: z[k] for k in ("arm_state", "hand_state", "arm_actions", "hand_actions", "centers")}
 
 
+# The last stored state is current; select -5.0 s through -0.1 s at 10 Hz.
+WLA_HISTORY_SLOTS = slice(-101, -1, 2)
+
+
+@lru_cache(maxsize=2)
+def load_state_valid_episode(path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    columns = ("arm_state", "hand_state", "arm_actions", "hand_actions", "state_valid", "action_valid")
+    table = pq.read_table(path, columns=list(columns))
+
+    def values(key, width, dtype):
+        column = table[key].combine_chunks()
+        if key == "action_valid" and pa.types.is_boolean(column.type):
+            if column.null_count:
+                raise ValueError(f"Null in {key}: {path}")
+            return column.to_numpy(zero_copy_only=False).reshape(len(table), 1)
+        if pa.types.is_fixed_size_list(column.type):
+            valid_width = column.type.list_size == width
+        elif pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+            valid_width = np.all(np.diff(column.offsets.to_numpy()) == width)
+        else:
+            raise ValueError(f"Expected a list column {key} in {path}")
+        if not valid_width or column.null_count or column.values.null_count:
+            raise ValueError(f"Invalid width or null in {key}: {path}")
+        if dtype is bool and not pa.types.is_boolean(column.type.value_type):
+            raise ValueError(f"Expected boolean {key} in {path}")
+        return column.flatten().to_numpy(zero_copy_only=False).astype(dtype, copy=False).reshape(len(table), width)
+
+    states = np.concatenate((
+        values("arm_state", 7000, np.float64).reshape(-1, 200, 35),
+        values("hand_state", 2400, np.float64).reshape(-1, 200, 12),
+    ), axis=-1)
+    actions = np.concatenate((
+        values("arm_actions", 5100, np.float64).reshape(-1, 50, 102),
+        values("hand_actions", 600, np.float64).reshape(-1, 50, 12),
+    ), axis=-1)
+    if not np.isfinite(states).all() or not np.isfinite(actions).all():
+        raise ValueError(f"Nonfinite state or action in {path}")
+    return states, actions, values("state_valid", 200, bool), values("action_valid", 1, bool)[:, 0]
+
+
 _video_readers = OrderedDict()
 
 
@@ -131,12 +174,22 @@ class FullPipelineDataset(Dataset):
         start = 0 if episode_id == 0 else int(self.ends[episode_id - 1])
         entry = self.episodes[episode_id]
         row = entry["valid_rows"][index - start]
-        z = load_body(entry["body"])
-        center = int(z["centers"][row])
-        raw_state = np.concatenate((z["arm_state"][center], z["hand_state"][center]))
-        state, state_mask = pack_state((raw_state - self.so) / self.ss)
-        indices = center + np.arange(1, 51)
-        action = np.concatenate((z["arm_actions"][indices], z["hand_actions"][indices]), axis=-1)
+        parquet = entry.get("state_valid_parquet")
+        if parquet:
+            states, actions, state_valid, action_valid = load_state_valid_episode(parquet)
+            if not action_valid[row]:
+                raise ValueError(f"Manifest selected invalid action row {row} in {parquet}")
+            raw_state, action = states[row, -1], actions[row]
+        else:
+            z = load_body(entry["body"])
+            center = int(z["centers"][row])
+            raw_state = np.concatenate((z["arm_state"][center], z["hand_state"][center]))
+            indices = center + np.arange(1, 51)
+            action = np.concatenate((z["arm_actions"][indices], z["hand_actions"][indices]), axis=-1)
+        if parquet and not state_valid[row, -1]:
+            state, state_mask = np.zeros(60, np.float32), np.zeros(60, bool)
+        else:
+            state, state_mask = pack_state((raw_state - self.so) / self.ss)
         action = ((action - self.ao) / self.asc).astype(np.float32)
         assert action.shape == (50, 114) and np.isfinite(action).all()
         images = [read_frame(entry["videos"][key], row) for key, _ in CAMERAS]
@@ -151,9 +204,13 @@ class FullPipelineDataset(Dataset):
                 "arm_type": "dual_with_legs", "robot_type": "unitree"}
         if self.history_frames:
             from .state_history import history_rows, pack_history
-            rows, valid = history_rows(row)
-            history_centers = z['centers'][rows]
-            raw = np.concatenate((z['arm_state'][history_centers], z['hand_state'][history_centers]), axis=-1)
+            if parquet:
+                raw = states[row, WLA_HISTORY_SLOTS]
+                valid = state_valid[row, WLA_HISTORY_SLOTS]
+            else:
+                rows, valid = history_rows(row)
+                history_centers = z['centers'][rows]
+                raw = np.concatenate((z['arm_state'][history_centers], z['hand_state'][history_centers]), axis=-1)
             example['state_history'], example['state_history_mask'] = pack_history(raw, valid, self.so, self.ss)
             draw = 0.0 if self.prompt_mode == 'full_only' else np.random.random()
             if draw < .5:
