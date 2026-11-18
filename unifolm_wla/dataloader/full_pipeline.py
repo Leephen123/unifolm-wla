@@ -56,8 +56,11 @@ def load_body(path):
         return {k: z[k] for k in ("arm_state", "hand_state", "arm_actions", "hand_actions", "centers")}
 
 
-# The last stored state is current; select -5.0 s through -0.1 s at 10 Hz.
-WLA_HISTORY_SLOTS = slice(-101, -1, 2)
+# In both layouts the last slot is current. Select -5.0 s through -0.1 s.
+PARQUET_HISTORY_SLOTS = {
+    100: slice(-51, -1),
+    200: slice(-101, -1, 2),
+}
 
 
 @lru_cache(maxsize=2)
@@ -67,6 +70,14 @@ def load_state_valid_episode(path):
 
     columns = ("arm_state", "hand_state", "arm_actions", "hand_actions", "state_valid", "action_valid")
     table = pq.read_table(path, columns=list(columns))
+    if not len(table):
+        raise ValueError(f"Empty state-valid episode: {path}")
+    first_mask = table["state_valid"][0]
+    if not first_mask.is_valid or not hasattr(first_mask, "values"):
+        raise ValueError(f"Expected a per-state validity list in {path}")
+    state_steps = len(first_mask.values)
+    if state_steps not in PARQUET_HISTORY_SLOTS:
+        raise ValueError(f"Expected 100 or 200 state slots, got {state_steps}: {path}")
 
     def values(key, width, dtype):
         column = table[key].combine_chunks()
@@ -87,8 +98,8 @@ def load_state_valid_episode(path):
         return column.flatten().to_numpy(zero_copy_only=False).astype(dtype, copy=False).reshape(len(table), width)
 
     states = np.concatenate((
-        values("arm_state", 7000, np.float64).reshape(-1, 200, 35),
-        values("hand_state", 2400, np.float64).reshape(-1, 200, 12),
+        values("arm_state", state_steps * 35, np.float64).reshape(-1, state_steps, 35),
+        values("hand_state", state_steps * 12, np.float64).reshape(-1, state_steps, 12),
     ), axis=-1)
     actions = np.concatenate((
         values("arm_actions", 5100, np.float64).reshape(-1, 50, 102),
@@ -96,7 +107,7 @@ def load_state_valid_episode(path):
     ), axis=-1)
     if not np.isfinite(states).all() or not np.isfinite(actions).all():
         raise ValueError(f"Nonfinite state or action in {path}")
-    return states, actions, values("state_valid", 200, bool), values("action_valid", 1, bool)[:, 0]
+    return states, actions, values("state_valid", state_steps, bool), values("action_valid", 1, bool)[:, 0]
 
 
 _video_readers = OrderedDict()
@@ -228,8 +239,9 @@ class FullPipelineDataset(Dataset):
         if self.history_frames:
             from .state_history import history_rows, pack_history
             if parquet:
-                raw = states[row, WLA_HISTORY_SLOTS]
-                valid = state_valid[row, WLA_HISTORY_SLOTS]
+                history_slots = PARQUET_HISTORY_SLOTS[states.shape[1]]
+                raw = states[row, history_slots]
+                valid = state_valid[row, history_slots]
             else:
                 rows, valid = history_rows(row)
                 history_centers = z['centers'][rows]

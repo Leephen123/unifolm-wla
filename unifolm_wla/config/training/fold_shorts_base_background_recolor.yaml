@@ -1,4 +1,4 @@
-run_id: unifolm-wla-base-shorts-recolor-2nodes-b64-40k
+run_id: wla_1013-1113_fold_the_short_jeans_old_glove_recolor_state10hz
 run_root_dir: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/runs
 seed: 42
 wandb_entity: ${oc.env:WANDB_ENTITY,null}
@@ -54,11 +54,11 @@ datasets:
     image_size_wh:
     - 448
     - 320
-    manifest_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove/manifest.json
+    manifest_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove_10hz/manifest.json
     background_recolor: true
     background_recolor_probability: 0.5  # Probability per training sample.
-    background_recolor_manifest_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove/manifest_background_masks_tracked.json
-    statistics_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove/dataset_statistics.json
+    background_recolor_manifest_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove_10hz/manifest_background_masks_tracked.json
+    statistics_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove_10hz/dataset_statistics.json
     per_device_batch_size: 64
     num_workers: 2
     prompt_mode: full_only
@@ -125,7 +125,7 @@ validation:
   - 19
   - 20
   - 21
-  experiment_id: unifolm-wla-base-shorts-recolor-2nodes-b64-40k
+  experiment_id: wla_1013-1113_fold_the_short_jeans_old_glove_recolor_state10hz
   dataset: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/Fold_the_short_jeans_dt_yaw_long_history/eval/Fold_the_short_jeans_eval_lerobot
   reference: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/Fold_the_short_jeans_dt_yaw_long_history/eval/prepared
 training_optimization: blocks_worker
@@ -138,4 +138,4 @@ checkpoint_retention:
   - hand_rmse
   - rotation_mean_deg
   - rotation_rmse_deg
-output_dir: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/runs/unifolm-wla-base-shorts-recolor-2nodes-b64-40k
+output_dir: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/runs/wla_1013-1113_fold_the_short_jeans_old_glove_recolor_state10hz
