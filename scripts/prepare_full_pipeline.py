@@ -65,14 +65,16 @@ def discover_selection(train, prompt):
     }
 
 
-def prepare(selection, selection_path):
+def prepare(selection, selection_path, head_camera="front_head"):
     import av
     import numpy as np
     import pyarrow.parquet as pq
 
     # Direct execution from scripts/ uses the checkout's training data contract.
     sys.path.insert(0, str(REPO))
-    from unifolm_wla.dataloader.full_pipeline import CAMERAS, load_state_valid_episode, pack_state, pad_resize
+    from unifolm_wla.dataloader.full_pipeline import cameras_for_head, load_state_valid_episode, pack_state, pad_resize
+
+    cameras = cameras_for_head(head_camera)
 
     entries, groups = [], []
     all_rows = all_valid = 0
@@ -163,7 +165,7 @@ def prepare(selection, selection_path):
 
             videos = {
                 key: str(root / info["video_path"].format(**file_args, video_key=key))
-                for key, _ in CAMERAS
+                for key, _ in cameras
             }
             for path in videos.values():
                 if not Path(path).is_file():
@@ -231,6 +233,7 @@ def prepare(selection, selection_path):
 
     manifest = {
         "selection": str(selection_path), "prompt": selection["prompt"], "episodes": entries,
+        "head_camera": head_camera,
         "total_frames": all_rows, "valid_anchors": all_valid,
     }
     statistics = {"full_pipeline": {
@@ -252,6 +255,7 @@ def main():
     parser.add_argument("--selection", type=Path, help="Use an existing selection.json instead of scanning train/.")
     parser.add_argument("--prompt", help="Task prompt when generating a selection.")
     parser.add_argument("--dataset-name", required=True, help="Output folder name under dataset/prepared/.")
+    parser.add_argument("--head-camera", choices=("front_head", "fov_head"), default="front_head")
     parser.add_argument("--sam-repo", type=Path, help="Submit SAM 3.1 jobs using this repository after preparation.")
     parser.add_argument("--sam-deps", type=Path, help="PyAV/PyArrow directory for the SAM launcher, if needed.")
     parser.add_argument("--sam-shards", type=int, help="Number of SAM Slurm shards.")
@@ -269,6 +273,8 @@ def main():
         parser.error("With --selection the prompt comes from that file.")
     if args.sam_repo and not args.dataset_root:
         parser.error("--sam-repo requires --dataset-root.")
+    if args.sam_repo and args.head_camera == "fov_head":
+        parser.error("For fov_head, prepare the manifest and merge the sofa SAM mask index separately.")
     if not args.sam_repo and any(value is not None for value in
                                  (args.sam_deps, args.sam_shards, args.sam_partition, args.sam_nodelist)):
         parser.error("SAM options require --sam-repo.")
@@ -297,7 +303,7 @@ def main():
             if value is not None:
                 sam_command.extend((flag, str(value.expanduser().resolve(strict=True) if isinstance(value, Path) else value)))
 
-    manifest, statistics, acceptance = prepare(selection, selection_path)
+    manifest, statistics, acceptance = prepare(selection, selection_path, head_camera=args.head_camera)
     output.mkdir(parents=True, exist_ok=False)
     if not args.selection:
         write_json(selection_path, selection)

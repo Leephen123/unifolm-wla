@@ -12,6 +12,8 @@ import torch
 from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 
+from .recolor_config import palette_colors, recolor_surfaces, resolve_palettes, resolve_training_palettes
+
 CAMERAS = (("front_head", "head_left"), ("left_hand", "cam_wrist_left"),
            ("right_hand", "cam_wrist_right"))
 # Source G1_29_BODY_NAMES: wr_rel_1010/data_res/dds.py. Keep every state47 channel.
@@ -19,6 +21,11 @@ STATE_SLOTS = np.array(list(range(48, 54)) + list(range(54, 60)) +
                        list(range(32, 35)) + list(range(0, 7)) +
                        list(range(16, 23)) + list(range(41, 47)) +
                        list(range(10, 16)) + list(range(26, 32)))
+
+
+def cameras_for_head(head_camera):
+    recolor_surfaces(head_camera)
+    return ((head_camera, CAMERAS[0][1]), *CAMERAS[1:])
 
 
 def pad_resize(image: Image.Image, size=(448, 320)) -> Image.Image:
@@ -148,14 +155,29 @@ def resolve_training_data(data):
 class FullPipelineDataset(Dataset):
     def __init__(self, manifest_path, statistics_path, history_frames=0, *,
                  background_recolor=False, prompt_mode=None,
-                 background_recolor_probability=DEFAULT_BACKGROUND_RECOLOR_PROBABILITY):
+                 background_recolor_probability=DEFAULT_BACKGROUND_RECOLOR_PROBABILITY,
+                 head_camera="front_head", recolor_palettes=None):
         manifest = json.loads(Path(manifest_path).read_text())
         self.episodes = manifest["episodes"]
+        self.head_camera = head_camera
+        self.cameras = cameras_for_head(head_camera)
+        if manifest.get("head_camera", head_camera) != head_camera:
+            raise ValueError(f"Training manifest does not match head camera {head_camera}.")
+        for entry in self.episodes:
+            if head_camera not in entry["videos"]:
+                raise ValueError(f"Training manifest lacks {head_camera}: {entry['dataset']} episode "
+                                 f"{entry['episode_index']}.")
         probability = _recolor_probability(background_recolor_probability)
         self.background_recolor_probability = probability if background_recolor else 0.0
         self.prompt_mode = prompt_mode
-        if self.background_recolor_probability > 0 and any("background_masks_parquet" not in e for e in self.episodes):
-            raise ValueError("background_recolor requires background_masks_parquet for every episode.")
+        if self.background_recolor_probability > 0:
+            mask_camera = manifest.get("background_mask_camera", "front_head")
+            if mask_camera != head_camera:
+                raise ValueError(f"Mask camera {mask_camera} does not match training head camera {head_camera}.")
+            if any("background_masks_parquet" not in e for e in self.episodes):
+                raise ValueError("background_recolor requires background_masks_parquet for every episode.")
+            palettes = recolor_palettes if recolor_palettes is not None else resolve_palettes(head_camera)
+            self.recolor_palettes = palette_colors(head_camera, palettes)
         self.history_frames = int(history_frames)
         assert self.history_frames in (0, 50)
         self.prompt = manifest["prompt"]
@@ -192,13 +214,14 @@ class FullPipelineDataset(Dataset):
             state, state_mask = pack_state((raw_state - self.so) / self.ss)
         action = ((action - self.ao) / self.asc).astype(np.float32)
         assert action.shape == (50, 114) and np.isfinite(action).all()
-        images = [read_frame(entry["videos"][key], row) for key, _ in CAMERAS]
+        images = [read_frame(entry["videos"][key], row) for key, _ in self.cameras]
         probability = self.background_recolor_probability
         if probability == 1.0 or (probability > 0 and np.random.random() < probability):
-            from .background_recolor import recolor_front_head
-            images[0] = recolor_front_head(images[0], entry["background_masks_parquet"], row)
+            from .background_recolor import recolor_head
+            images[0] = recolor_head(images[0], entry["background_masks_parquet"], row,
+                                     self.head_camera, self.recolor_palettes)
         images = [pad_resize(image) for image in images]
-        example = {"image": images, "image_roles": [role for key, role in CAMERAS],
+        example = {"image": images, "image_roles": [role for _, role in self.cameras],
                 "lang": self.prompt, "state": state, "state_mask": state_mask,
                 "action": action, "action_mask": np.ones(114, dtype=bool),
                 "arm_type": "dual_with_legs", "robot_type": "unitree"}
@@ -241,6 +264,8 @@ def build_full_pipeline_dataloader(cfg):
         manifest, data.statistics_path, data.get("history_frames", 0),
         background_recolor=probability > 0,
         background_recolor_probability=probability,
+        head_camera=data.get("head_camera", "front_head"),
+        recolor_palettes=resolve_training_palettes(data) if probability > 0 else None,
         prompt_mode=data.get("prompt_mode"),
     )
     # Accelerate shards the ordinary dataloader exactly once across ranks.

@@ -63,6 +63,7 @@ def main():
     from omegaconf import OmegaConf
     from transformers import get_scheduler
     from unifolm_wla.dataloader.full_pipeline import build_full_pipeline_dataloader, resolve_training_data
+    from unifolm_wla.dataloader.recolor_config import recolor_surfaces, resolve_training_palettes
     from unifolm_wla.model.framework.base_framework import build_framework
 
     parser = argparse.ArgumentParser()
@@ -77,9 +78,16 @@ def main():
     parser.add_argument("--validate-smoke", action="store_true", help="Run full validation at the final smoke step")
     args = parser.parse_args()
     cfg = OmegaConf.load(args.config)
-    manifest, _ = resolve_training_data(cfg.datasets.vla_data)
+    data = cfg.datasets.vla_data
+    manifest, recolor_probability = resolve_training_data(data)
     if not manifest.is_file():
         raise FileNotFoundError(f"Training manifest does not exist: {manifest}")
+    data.head_camera = data.get("head_camera", "front_head")
+    recolor_surfaces(data.head_camera)
+    if recolor_probability > 0:
+        resolved_palettes = resolve_training_palettes(data)
+        data.background_recolor_palettes = list(resolved_palettes)
+        data.background_recolor_resolved_palettes = resolved_palettes
     args.batch_size = (cfg.datasets.vla_data.per_device_batch_size
                        if args.batch_size is None else args.batch_size)
     args.output = args.output or cfg.output_dir

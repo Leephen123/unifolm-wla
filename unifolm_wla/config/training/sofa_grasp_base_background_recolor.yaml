@@ -1,0 +1,135 @@
+run_id: unifolm-wla-base-sofa-recolor
+run_root_dir: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/runs
+seed: 42
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+wandb_project: openpi
+is_debug: false
+framework:
+  name: QwenMMDiT
+  qwenvl:
+    base_vlm: /storage/wangdonglinLab/weizhenyu/kuimouyu/models/unifolm-wla/UnifoLM-WLA-1.0-Base/tokenizer
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2560
+  robot_state_projector:
+    enabled: true
+    input_dim: 120
+    projector_hidden_size: null
+    load_from: null
+  action_model:
+    training_rtc:
+      enabled: true
+      probability: 0.8
+      min_prefix: 5
+      max_prefix: 15
+    action_model_type: DiT-L
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 114
+    state_dim: 0
+    action_horizon: 50
+    repeated_diffusion_steps: 1
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    embodiment_types:
+    - unitree
+    diffusion_model_cfg:
+      cross_attention_dim: 2560
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      positional_embeddings: null
+datasets:
+  vla_data:
+    dataset_py: full_pipeline
+    head_camera: fov_head
+    image_size_wh:
+    - 448
+    - 320
+    manifest_path: ${oc.env:WLA_SOFA_PREPARED_DIR}/manifest.json
+    background_recolor: true
+    background_recolor_palettes:
+    - beige_sofa_light_oak_floor
+    - slate_blue_sofa_soft_light_gray_floor
+    - olive_sofa_warm_stone_floor
+    - cream_sofa_golden_honey_oak_floor
+    - neutral_charcoal_sofa_natural_oak_floor
+    - caramel_sofa_walnut_floor
+    - terracotta_sofa_light_beech_floor
+    - sage_sofa_whitewashed_oak_floor
+    - navy_sofa_warm_gray_floor
+    - burgundy_sofa_light_taupe_floor
+    - sand_sofa_smoked_walnut_floor
+    - taupe_sofa_dark_oak_floor
+    - greige_sofa_travertine_floor
+    - muted_teal_sofa_neutral_oak_floor
+    - cocoa_sofa_ivory_floor
+    background_recolor_probability: 0.5  # Probability per training sample.
+    background_recolor_manifest_path: ${oc.env:WLA_SOFA_PREPARED_DIR}/manifest_background_masks_tracked.json
+    statistics_path: ${oc.env:WLA_SOFA_PREPARED_DIR}/dataset_statistics.json
+    per_device_batch_size: 64
+    num_workers: 2
+    prompt_mode: full_only
+    history_frames: 50
+    history_seconds: 5
+    text_max_length: 640
+    caption_path: null
+trainer:
+  gpus_per_node: 8
+  is_resume: false
+  freeze_vlm: false
+  train_robot_state_projector: true
+  max_train_steps: 40000
+  num_warmup_steps: 200
+  save_interval: 250
+  logging_frequency: 10
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  learning_rate:
+    base: 5.0e-05
+    action_model: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  optimizer:
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: safetensors
+  initialization: pretrained
+  gradient_checkpointing: true
+  world_size: 16
+  global_batch: 1024
+  pretrained_checkpoint: /storage/wangdonglinLab/weizhenyu/kuimouyu/models/unifolm-wla/UnifoLM-WLA-1.0-Base/checkpoints/model.safetensors
+validation:
+  output_subdir: validation-optimized
+  validate_on_resume: false
+  enabled: false
+  interval: 250
+  batch_size: 8
+  seed: 42
+  episodes: []
+  experiment_id: unifolm-wla-base-sofa-recolor
+  dataset: null
+  reference: null
+training_optimization: blocks_worker
+checkpoint_retention:
+  policy: open_loop_metric_top5_union_plus_latest
+  top_k: 5
+  metrics:
+  - root_delta_rmse_m
+  - body_xyz_rmse_cm
+  - hand_rmse
+  - rotation_mean_deg
+  - rotation_rmse_deg
+output_dir: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/runs/unifolm-wla-base-sofa-recolor

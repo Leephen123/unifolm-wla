@@ -36,8 +36,10 @@ def native_actions(canonical_actions):
 
 class TrainingValidation:
     def __init__(self, cfg, accelerator, out):
-        from unifolm_wla.dataloader.full_pipeline import CAMERAS, pack_state, pad_resize, read_frame
+        from unifolm_wla.dataloader.full_pipeline import cameras_for_head, pack_state, pad_resize, read_frame
         self.accelerator, self.cfg = accelerator, cfg
+        head_camera = cfg.datasets.vla_data.get("head_camera", "front_head")
+        self.cameras = cameras_for_head(head_camera)
         assert int(cfg.datasets.vla_data.history_frames) == 50
         self.out = Path(out) / cfg.validation.output_subdir
         self.out.mkdir(exist_ok=True)
@@ -45,6 +47,8 @@ class TrainingValidation:
         assert self.batch_size > 0
         self.dataset, self.reference = Path(cfg.validation.dataset), Path(cfg.validation.reference)
         self.meta = read_json(self.reference / "manifest.json")
+        if self.meta.get("head_camera", "front_head") != head_camera:
+            raise ValueError(f"Validation reference does not match head camera {head_camera}.")
         stats = read_json(cfg.datasets.vla_data.statistics_path)["full_pipeline"]
         so, ss = (np.asarray(stats["state"][k], dtype=np.float32) for k in ("offset", "scale"))
         self.ao, self.asc = (np.asarray(stats["action"][k], dtype=np.float32) for k in ("offset", "scale"))
@@ -70,8 +74,8 @@ class TrainingValidation:
             for k, anchor in enumerate(entry["anchors"]):
                 state, mask = pack_state((entry["states"][anchor] - so) / ss)
                 images = [pad_resize(read_frame(str(self.dataset / f"videos/chunk-000/{camera}/episode_{eid:06d}.mp4"), int(anchor)))
-                          for camera, _ in CAMERAS]
-                examples.append(dict(image=images, image_roles=[role for _, role in CAMERAS], lang=self.prompt,
+                          for camera, _ in self.cameras]
+                examples.append(dict(image=images, image_roles=[role for _, role in self.cameras], lang=self.prompt,
                     state=state, state_mask=mask, action=(targets[k] - self.ao) / self.asc,
                     action_mask=np.ones(114, dtype=bool), arm_type="dual_with_legs", robot_type="unitree"))
             from unifolm_wla.dataloader.state_history import history_rows, pack_history
@@ -100,7 +104,6 @@ class TrainingValidation:
                     np.concatenate((valid, np.repeat(valid[-1:], padding, axis=0)))))
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="validation-cpu")
         self.pending = []
-        self.cameras = CAMERAS
 
     def initialize_runtime(self, model):
         if not self.examples:

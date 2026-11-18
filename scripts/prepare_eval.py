@@ -127,6 +127,7 @@ def main():
     parser.add_argument("--output", type=Path, help="New reference directory (default: eval/prepared).")
     parser.add_argument("--episodes", type=int, nargs="+", help="Episode IDs to prepare (default: all).")
     parser.add_argument("--scene", default="fold shorts", help="Scene label in the evaluation report.")
+    parser.add_argument("--head-camera", choices=("front_head", "fov_head"), default="front_head")
     args = parser.parse_args()
 
     if args.dataset_root:
@@ -151,16 +152,18 @@ def main():
 
     sys.path.insert(0, str(REPO))
     from examples.unifolm_wla.open_loop_eval import canonical
-    from unifolm_wla.dataloader.full_pipeline import CAMERAS
+    from unifolm_wla.dataloader.full_pipeline import cameras_for_head
 
+    cameras = cameras_for_head(args.head_camera)
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as scratch:
         stage = Path(scratch) / output.name
         stage.mkdir()
-        groups = [prepare_episode(dataset, info, by_id[eid], stage, args.scene, canonical, CAMERAS)
+        groups = [prepare_episode(dataset, info, by_id[eid], stage, args.scene, canonical, cameras)
                   for eid in selected]
         chunks = sum(len(group["chunks"]) for group in groups)
-        write_json(stage / "manifest.json", dict(groups=groups, channels=evaluation_channels()))
+        write_json(stage / "manifest.json",
+                   dict(groups=groups, channels=evaluation_channels(), head_camera=args.head_camera))
         write_json(stage / "acceptance.json", dict(status="PASS", episodes=len(groups), chunks=chunks,
                                                  parquet_targets_equal=True))
         stage.rename(output)

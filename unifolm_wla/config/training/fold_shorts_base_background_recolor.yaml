@@ -50,6 +50,7 @@ framework:
 datasets:
   vla_data:
     dataset_py: full_pipeline
+    head_camera: front_head
     image_size_wh:
     - 448
     - 320
