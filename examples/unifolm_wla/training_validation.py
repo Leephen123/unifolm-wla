@@ -198,7 +198,7 @@ class TrainingValidation:
             arrays = dict(predictions=p, targets=t, anchors=entry["anchors"], body_centers=entry["centers"],
                 segment_ids=entry["segment_ids"], time_s=entry["time_s"], valid_mask=np.ones(len(p), dtype=bool),
                 chunk_ids=np.repeat(np.arange(len(entry["anchors"])), 50), video_time_s=np.asarray(entry["group"]["times"]),
-                checkpoint=np.asarray(str(self.out.parent / "checkpoints" / f"step_{step:06d}")), step=np.asarray(step))
+                checkpoint=np.asarray(str(self.out.parent / "checkpoints" / str(step))), step=np.asarray(step))
             np.savez_compressed(folder / f"episode_{eid:03d}.npz", **arrays)
             plot_episode(folder / f"episode_{eid:03d}/open_loop_errors_new.png", arrays, self.meta["channels"],
                          f"UnifoLM-WLA step {step}, episode {eid}", history_frames=50)
@@ -235,7 +235,7 @@ class TrainingValidation:
         results["loss"] = sum(e["loss_sum"] for e in episodes) / sum(e["loss_count"] for e in episodes)
         results["gpu_phase_seconds"] = gpu_seconds
         write_json(folder / "checkpoint.json", dict(step=step, metrics=results, episodes=episodes,
-            checkpoint_path=str(self.out.parent / "checkpoints" / f"step_{step:06d}"), validation={"status": "PASS"}))
+            checkpoint_path=str(self.out.parent / "checkpoints" / str(step)), validation={"status": "PASS"}))
         (folder / "media").mkdir()
         for camera, _ in self.cameras:
             (folder / "media" / camera).symlink_to(self.dataset / "videos/chunk-000" / camera, target_is_directory=True)

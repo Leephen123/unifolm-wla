@@ -4,6 +4,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def load_base(model, path):
 
 def save_checkpoint(accelerator, model, out, step, epoch, batches_in_epoch):
     from safetensors.torch import save_file
-    folder = out / "checkpoints" / f"step_{step:06d}"
+    folder = out / "checkpoints" / str(step)
     # All ranks participate: this saves ZeRO optimizer partitions and RNG state.
     accelerator.save_state(str(folder), safe_serialization=True)
     state_dict = accelerator.get_state_dict(model)
@@ -43,12 +44,14 @@ def save_checkpoint(accelerator, model, out, step, epoch, batches_in_epoch):
         (folder / "progress.json").write_text(json.dumps({"step": step, "epoch": epoch,
                                                          "batches_in_epoch": batches_in_epoch}))
         (folder / "COMPLETE").touch()
-        # Only remove optimizer partitions after the new complete checkpoint exists.
-        for old in sorted((out / "checkpoints").glob("step_*")):
-            if old == folder:
+        # Keep DeepSpeed model/optimizer and RNG states only for the newest checkpoint.
+        for old in (out / "checkpoints").iterdir():
+            if old == folder or not (old / "COMPLETE").is_file():
                 continue
-            for optim in old.rglob("*optim_states.pt"):
-                optim.unlink()
+            if (old / "pytorch_model").exists():
+                shutil.rmtree(old / "pytorch_model")
+            for rng_state in old.rglob("random_states_*.pkl"):
+                rng_state.unlink()
     accelerator.wait_for_everyone()
 
 
@@ -182,11 +185,16 @@ def main():
         step, epoch, batches_in_epoch = progress["step"], progress["epoch"], progress["batches_in_epoch"]
     run = None
     if accelerator.is_main_process and not args.smoke_steps:
-        assert os.environ.get("WANDB_MODE", "online") == "online"
+        wandb_mode = os.environ.get("WANDB_MODE", "offline")
+        if wandb_mode not in {"online", "offline"}:
+            raise ValueError(f"Training requires W&B online or offline mode, got {wandb_mode!r}")
         run = wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project,
-                         name=out.name, mode="online", dir=str(out),
+                         name=out.name, mode=wandb_mode, dir=str(out),
                          config=OmegaConf.to_container(cfg, resolve=True))
-        (out / "wandb-run.json").write_text(json.dumps({"url": run.url, "id": run.id}))
+        (out / "wandb-run.json").write_text(json.dumps({
+            "url": run.url if wandb_mode == "online" else None,
+            "id": run.id, "mode": wandb_mode, "dir": run.dir,
+        }))
     if run:
         run.define_metric("*", step_metric="step")
         run.define_metric("validation/*", step_metric="validation/step")

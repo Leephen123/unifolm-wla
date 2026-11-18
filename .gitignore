@@ -272,3 +272,18 @@ unifolm_wla/model/framework/VLM4A/QwenGR00T_v2.py
 plot_loss.py
 2026-05-17-164700-local-command-caveatcaveat-the-messages-below.txt
 unifolm_wla/scripts
+
+dataset/
+logs/
+runs/
+
+# Local training artifacts; retain only the reproducible mix-glove config.
+/runs/*
+!/runs/wla_1013-1113_fold_the_short_jeans_mix_glove_recolor/
+/runs/wla_1013-1113_fold_the_short_jeans_mix_glove_recolor/*
+!/runs/wla_1013-1113_fold_the_short_jeans_mix_glove_recolor/config.yaml
+/wandb/
+*.safetensors
+*.pkl
+.env.*
+.netrc

@@ -17,7 +17,7 @@ def select_top_five(results):
 
 def prune_checkpoints(out):
     out = Path(out).resolve()
-    checkpoints = {int(p.name[5:]): p for p in (out / 'checkpoints').glob('step_*')
+    checkpoints = {int(p.name.removeprefix('step_')): p for p in (out / 'checkpoints').iterdir()
                    if (p / 'COMPLETE').is_file()}
     if not checkpoints:
         return
