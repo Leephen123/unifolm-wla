@@ -66,7 +66,9 @@ def main():
     from omegaconf import OmegaConf
     from transformers import get_scheduler
     from unifolm_wla.dataloader.full_pipeline import build_full_pipeline_dataloader, resolve_training_data
-    from unifolm_wla.dataloader.recolor_config import recolor_surfaces, resolve_training_palettes
+    from unifolm_wla.dataloader.recolor_config import (
+        recolor_surfaces, resolve_floor_textures, resolve_table_textures, resolve_training_palettes,
+    )
     from unifolm_wla.model.framework.base_framework import build_framework
 
     parser = argparse.ArgumentParser()
@@ -87,7 +89,12 @@ def main():
         raise FileNotFoundError(f"Training manifest does not exist: {manifest}")
     data.head_camera = data.get("head_camera", "front_head")
     recolor_surfaces(data.head_camera)
-    if recolor_probability > 0:
+    table_appearance = data.get("table_appearance")
+    if table_appearance is not None and table_appearance.texture_probability > 0:
+        resolve_table_textures(table_appearance.get("textures", ()))
+        if table_appearance.get("floor_textures"):
+            resolve_floor_textures(table_appearance.floor_textures)
+    if recolor_probability > 0 or (table_appearance and table_appearance.color_probability > 0):
         resolved_palettes = resolve_training_palettes(data)
         data.background_recolor_palettes = list(resolved_palettes)
         data.background_recolor_resolved_palettes = resolved_palettes
@@ -218,6 +225,9 @@ def main():
     max_steps = args.smoke_steps or cfg.trainer.max_train_steps
     records = []
     prompt_counts = np.zeros(4, dtype=np.int64)
+    if table_appearance is not None:
+        from unifolm_wla.dataloader.table_appearance import TABLE_APPEARANCES
+        appearance_counts = np.zeros(len(TABLE_APPEARANCES), dtype=np.int64)
     model.train()
     if validation and args.resume and cfg.validation.validate_on_resume:
         validation.infer(model, step)
@@ -271,6 +281,16 @@ def main():
                 if step == 1 or step % cfg.trainer.logging_frequency == 0:
                     counts = accelerator.reduce(torch.tensor(prompt_counts, device=accelerator.device), reduction='sum').cpu().tolist()
                     record.update({f'prompt/{name}_fraction':count/sum(counts) for name,count in zip(names,counts)})
+            if table_appearance is not None:
+                for example in batch["examples"]:
+                    appearance_counts[TABLE_APPEARANCES.index(example["table_appearance"])] += 1
+                if step == 1 or step % cfg.trainer.logging_frequency == 0:
+                    counts = accelerator.reduce(torch.tensor(appearance_counts, device=accelerator.device),
+                                                reduction="sum").cpu().tolist()
+                    record.update({
+                        f"table_appearance/{name}_fraction": count / sum(counts)
+                        for name, count in zip(TABLE_APPEARANCES, counts, strict=True)
+                    })
             records.append(record)
             if accelerator.is_main_process:
                 print(json.dumps(record), flush=True)

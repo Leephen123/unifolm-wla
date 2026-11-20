@@ -1,4 +1,4 @@
-"""Resolve surface color and combination names for training."""
+"""Resolve named surface colors and textures for training."""
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -94,6 +94,39 @@ def resolve_palettes(camera, names=None, *, saved=None):
             _require_keys(palette, surfaces, label)
         result[name] = {surface: _validate_color(palette[surface], f"{label}.{surface}") for surface in surfaces}
     return result
+
+
+def _resolve_textures(names, surface, option):
+    """Load an ordered list of named texture assets, relative to the presets."""
+    if (not isinstance(names, Sequence) or isinstance(names, str) or not names
+            or any(not isinstance(name, str) for name in names) or len(set(names)) != len(names)):
+        raise ValueError(f"{option} must be a nonempty list of distinct texture names.")
+    folder = f"{surface}_texture"
+    root = RECOLOR_CONFIG / folder
+    image_root = (root / "images").resolve()
+    images = []
+    for name in names:
+        config = _named_config(folder, name)
+        label = f"{surface.capitalize()} texture {name!r}"
+        _require_keys(config, ("image",), label)
+        value = config["image"]
+        if not isinstance(value, str) or not value or Path(value).is_absolute():
+            raise ValueError(f"{label} must use a relative image path.")
+        image = (root / value).resolve()
+        if not image.is_relative_to(image_root):
+            raise ValueError(f"{label} must reference an image under {image_root}.")
+        if not image.is_file():
+            raise FileNotFoundError(f"{label} image does not exist: {image}")
+        images.append(image)
+    return tuple(images)
+
+
+def resolve_table_textures(names):
+    return _resolve_textures(names, "table", "table_appearance.textures")
+
+
+def resolve_floor_textures(names):
+    return _resolve_textures(names, "floor", "table_appearance.floor_textures")
 
 
 def resolve_training_palettes(data):

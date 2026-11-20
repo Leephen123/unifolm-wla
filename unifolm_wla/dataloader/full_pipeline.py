@@ -158,6 +158,10 @@ def resolve_training_data(data):
     probability = _recolor_probability(
         data.get("background_recolor_probability", DEFAULT_BACKGROUND_RECOLOR_PROBABILITY)
     )
+    if data.get("table_appearance") is not None:
+        if data.get("background_recolor", False) and probability > 0:
+            raise ValueError("Choose either background_recolor or table_appearance.")
+        return Path(data["background_recolor_manifest_path"]), 0.0
     if data.get("background_recolor", False) and probability > 0:
         return Path(data.get("background_recolor_manifest_path") or data.manifest_path), probability
     return Path(data.manifest_path), 0.0
@@ -167,7 +171,7 @@ class FullPipelineDataset(Dataset):
     def __init__(self, manifest_path, statistics_path, history_frames=0, *,
                  background_recolor=False, prompt_mode=None,
                  background_recolor_probability=DEFAULT_BACKGROUND_RECOLOR_PROBABILITY,
-                 head_camera="front_head", recolor_palettes=None):
+                 head_camera="front_head", recolor_palettes=None, table_appearance=None):
         manifest = json.loads(Path(manifest_path).read_text())
         self.episodes = manifest["episodes"]
         self.head_camera = head_camera
@@ -181,12 +185,16 @@ class FullPipelineDataset(Dataset):
         probability = _recolor_probability(background_recolor_probability)
         self.background_recolor_probability = probability if background_recolor else 0.0
         self.prompt_mode = prompt_mode
-        if self.background_recolor_probability > 0:
+        self.table_appearance = table_appearance
+        if table_appearance is not None and self.background_recolor_probability:
+            raise ValueError("Choose either background recoloring or table appearance.")
+        if self.background_recolor_probability > 0 or table_appearance is not None:
             mask_camera = manifest.get("background_mask_camera", "front_head")
             if mask_camera != head_camera:
                 raise ValueError(f"Mask camera {mask_camera} does not match training head camera {head_camera}.")
             if any("background_masks_parquet" not in e for e in self.episodes):
                 raise ValueError("background_recolor requires background_masks_parquet for every episode.")
+        if self.background_recolor_probability > 0:
             palettes = recolor_palettes if recolor_palettes is not None else resolve_palettes(head_camera)
             self.recolor_palettes = palette_colors(head_camera, palettes)
         self.history_frames = int(history_frames)
@@ -227,7 +235,9 @@ class FullPipelineDataset(Dataset):
         assert action.shape == (50, 114) and np.isfinite(action).all()
         images = [read_frame(entry["videos"][key], row) for key, _ in self.cameras]
         probability = self.background_recolor_probability
-        if probability == 1.0 or (probability > 0 and np.random.random() < probability):
+        if self.table_appearance is not None:
+            images[0], appearance = self.table_appearance(images[0], entry, row)
+        elif probability == 1.0 or (probability > 0 and np.random.random() < probability):
             from .background_recolor import recolor_head
             images[0] = recolor_head(images[0], entry["background_masks_parquet"], row,
                                      self.head_camera, self.recolor_palettes)
@@ -236,6 +246,8 @@ class FullPipelineDataset(Dataset):
                 "lang": self.prompt, "state": state, "state_mask": state_mask,
                 "action": action, "action_mask": np.ones(114, dtype=bool),
                 "arm_type": "dual_with_legs", "robot_type": "unitree"}
+        if self.table_appearance is not None:
+            example["table_appearance"] = appearance
         if self.history_frames:
             from .state_history import history_rows, pack_history
             if parquet:
@@ -272,6 +284,10 @@ def build_full_pipeline_dataloader(cfg):
     data = cfg.datasets.vla_data
     assert list(data.image_size_wh) == [448, 320]
     manifest, probability = resolve_training_data(data)
+    table_appearance = None
+    if data.get("table_appearance") is not None:
+        from .table_appearance import TableAppearance
+        table_appearance = TableAppearance(data, manifest, cfg.seed)
     dataset = FullPipelineDataset(
         manifest, data.statistics_path, data.get("history_frames", 0),
         background_recolor=probability > 0,
@@ -279,6 +295,7 @@ def build_full_pipeline_dataloader(cfg):
         head_camera=data.get("head_camera", "front_head"),
         recolor_palettes=resolve_training_palettes(data) if probability > 0 else None,
         prompt_mode=data.get("prompt_mode"),
+        table_appearance=table_appearance,
     )
     # Accelerate shards the ordinary dataloader exactly once across ranks.
     return DataLoader(dataset, batch_size=data.per_device_batch_size, shuffle=True,

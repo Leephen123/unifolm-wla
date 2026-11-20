@@ -88,10 +88,14 @@ def prepare_episode(dataset, info, episode, output, scene, canonical, cameras):
         np.asarray([table["hand_actions"][row].as_py() for row in anchor_rows]).reshape(-1, ACTION_STEPS, 12),
     ), axis=-1)
     np.testing.assert_array_equal(native, expected_actions, err_msg=str(parquet))
+    arm_width = info["features"]["arm_state"]["shape"][0]
+    state_steps, remainder = divmod(arm_width, 35)
+    if remainder or state_steps not in (100, 200) or info["features"]["hand_state"]["shape"] != [state_steps * 12]:
+        raise ValueError(f"Expected matching 100- or 200-frame arm/hand state histories: {parquet}")
     for row in sorted({0, len(centers) // 2, len(centers) - 1}):
         expected_state = np.concatenate((
-            np.asarray(table["arm_state"][row].as_py()).reshape(200, 35)[-1],
-            np.asarray(table["hand_state"][row].as_py()).reshape(200, 12)[-1],
+            np.asarray(table["arm_state"][row].as_py()).reshape(state_steps, 35)[-1],
+            np.asarray(table["hand_state"][row].as_py()).reshape(state_steps, 12)[-1],
         ))
         np.testing.assert_array_equal(states[row], expected_state, err_msg=f"{parquet} row {row}")
 
