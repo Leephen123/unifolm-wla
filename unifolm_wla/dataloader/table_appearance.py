@@ -14,7 +14,7 @@ from .recolor_config import (
     _validate_color, palette_colors, resolve_floor_textures, resolve_table_textures, resolve_training_palettes,
 )
 
-TABLE_APPEARANCES = ("original", "color", "texture", "empty_table_mask", "floor_texture", "table_floor_texture")
+TABLE_APPEARANCES = ("original", "color", "texture", "empty_table_mask", "floor_texture", "table_floor_texture", "table_color_floor_texture")
 CACHE_VERSION = 1
 
 
@@ -152,53 +152,111 @@ def _composite(output, mask, *, palette=None, texture=None):
 
 
 class TableAppearance:
-    """An exclusive augmentation with optional flooring in the texture branch."""
+    """An exclusive augmentation with legacy or unified table-color + floor color/texture modes."""
 
     def __init__(self, data, manifest, seed):
         config = data.table_appearance
         self.camera = data.get("head_camera", "front_head")
         if self.camera != "front_head":
             raise ValueError("Table appearance requires front_head.")
-        self.color_probability = float(config.color_probability)
-        self.texture_probability = float(config.texture_probability)
         self.floor_texture_prefilter = config.get("floor_texture_prefilter", True)
         if type(self.floor_texture_prefilter) is not bool:
             raise ValueError("floor_texture_prefilter must be a boolean.")
-        self.total_probability = self.color_probability + self.texture_probability
-        if not (self.color_probability >= 0 and self.texture_probability >= 0
-                and 0 < self.total_probability <= 1):
-            raise ValueError("Table appearance probabilities must be nonnegative and sum to (0, 1].")
+        self.random_placement = config.get("random_placement", False)
+        if type(self.random_placement) is not bool:
+            raise ValueError("random_placement must be a boolean.")
+        self.min_table_area_fraction = float(config.get("min_table_area_fraction", 0.0))
+        if not (0.0 <= self.min_table_area_fraction < 1.0):
+            raise ValueError("min_table_area_fraction must be in [0, 1).")
+
+        unified = config.get("unified_probability")
+        self.unified_probability = None if unified is None else float(unified)
         self.seed = int(seed)
+        manifest_hash = hashlib.sha256(Path(manifest).read_bytes()).hexdigest()
+        self.cache = _surface_cache(config.cache_dir, manifest_hash, "table")
+        self.floor_cache = None
         self.colors = ()
-        if self.color_probability:
+        self.floor_colors = ()
+        self.textures = ()
+        self.floor_textures = ()
+
+        if self.unified_probability is not None:
+            if not (0 < self.unified_probability <= 1):
+                raise ValueError("unified_probability must be in (0, 1].")
+            if float(config.get("color_probability", 0)) or float(config.get("texture_probability", 0)):
+                raise ValueError("Do not combine unified_probability with color_probability/texture_probability.")
+            if config.get("textures"):
+                raise ValueError("Unified table-color + floor mode requires empty table_appearance.textures.")
+            self.color_probability = 0.0
+            self.texture_probability = 0.0
+            self.total_probability = self.unified_probability
+
             palettes = resolve_training_palettes(data)
+            paired = palette_colors(self.camera, palettes)
             extra = tuple(
                 _validate_color(color, f"table_appearance.extra_colors.{name}")
                 for name, color in config.get("extra_colors", {}).items()
             )
-            base = tuple(colors[0] for colors in palette_colors(self.camera, palettes))
-            self.colors = base + tuple((color["dark_rgb"], color["light_rgb"]) for color in extra)
-        self.textures = resolve_table_textures(config.get("textures", ())) if self.texture_probability else ()
-        floor_names = config.get("floor_textures")
-        self.floor_textures = resolve_floor_textures(floor_names) if floor_names else ()
-        self.floor_cache = None
-        manifest_hash = hashlib.sha256(Path(manifest).read_bytes()).hexdigest()
-        self.cache = _surface_cache(config.cache_dir, manifest_hash, "table")
-        if self.floor_textures:
-            if not self.texture_probability or not config.get("floor_cache_dir"):
-                raise ValueError("Floor textures require texture_probability and table_appearance.floor_cache_dir.")
+            self.colors = tuple(c[0] for c in paired) + tuple((c["dark_rgb"], c["light_rgb"]) for c in extra)
+            self.floor_colors = tuple(c[1] for c in paired)
+            floor_names = config.get("floor_textures")
+            self.floor_textures = resolve_floor_textures(floor_names) if floor_names else ()
+            if not config.get("floor_cache_dir"):
+                raise ValueError("Unified mode requires table_appearance.floor_cache_dir.")
             self.floor_cache = _surface_cache(config.floor_cache_dir, manifest_hash, "floor")
+        else:
+            self.color_probability = float(config.color_probability)
+            self.texture_probability = float(config.texture_probability)
+            self.total_probability = self.color_probability + self.texture_probability
+            if not (self.color_probability >= 0 and self.texture_probability >= 0
+                    and 0 < self.total_probability <= 1):
+                raise ValueError("Table appearance probabilities must be nonnegative and sum to (0, 1].")
+            if self.color_probability:
+                palettes = resolve_training_palettes(data)
+                extra = tuple(
+                    _validate_color(color, f"table_appearance.extra_colors.{name}")
+                    for name, color in config.get("extra_colors", {}).items()
+                )
+                base = tuple(colors[0] for colors in palette_colors(self.camera, palettes))
+                self.colors = base + tuple((color["dark_rgb"], color["light_rgb"]) for color in extra)
+            table_names = config.get("textures") or ()
+            if self.texture_probability and table_names:
+                self.textures = resolve_table_textures(table_names)
+            floor_names = config.get("floor_textures")
+            self.floor_textures = resolve_floor_textures(floor_names) if floor_names else ()
+            if self.texture_probability and not self.textures and not self.floor_textures:
+                raise ValueError("table_appearance requires textures or floor_textures when texture_probability > 0.")
+            if self.floor_textures:
+                if not self.texture_probability or not config.get("floor_cache_dir"):
+                    raise ValueError("Floor textures require texture_probability and table_appearance.floor_cache_dir.")
+                self.floor_cache = _surface_cache(config.floor_cache_dir, manifest_hash, "floor")
+
+    def _random_pose(self):
+        return (
+            float(np.random.uniform(-0.22, 0.22)),
+            float(np.random.uniform(1.45, 2.35)),
+            float(np.random.random()),
+            float(np.random.random()),
+        )
 
     def _placement(self, entry, surface="table"):
+        textures = self.floor_textures if surface == "floor" else self.textures
+        if self.random_placement:
+            return textures[int(np.random.randint(len(textures)))], self._random_pose()
         # The frame order, DataLoader worker, and rank do not change the placement.
         key = f'{self.seed}\0{entry["dataset"]}\0{entry["episode_index"]}'.encode()
-        textures = self.textures
         if surface == "floor":
             key = b"floor\0" + key
-            textures = self.floor_textures
         rng = np.random.default_rng(int.from_bytes(hashlib.sha256(key).digest()[:8], "little"))
         return textures[int(rng.integers(len(textures)))], (rng.uniform(-0.22, 0.22), rng.uniform(1.45, 2.35),
                                       rng.random(), rng.random())
+
+    def _valid_table(self, table):
+        if table is None:
+            return False
+        if self.min_table_area_fraction > 0 and float(table[0].mean()) < self.min_table_area_fraction:
+            return False
+        return True
 
     def __call__(self, image, entry, row):
         draw = np.random.random()
@@ -206,8 +264,40 @@ class TableAppearance:
             return image, "original"
 
         table = _surface_frame(self.cache, entry, row, image.size, "table")
+        if self.unified_probability is not None:
+            if not self._valid_table(table):
+                return image, "empty_table_mask"
+            output = np.array(image.convert("RGB"))
+            table_palette = self.colors[int(np.random.randint(len(self.colors)))]
+            _composite(output, table[0], palette=table_palette)
+
+            floor = _surface_frame(self.floor_cache, entry, row, image.size, "floor")
+            if floor is None:
+                return Image.fromarray(output), "color"
+
+            n_floor_colors = len(self.floor_colors)
+            n_floor_textures = len(self.floor_textures)
+            choice = int(np.random.randint(n_floor_colors + n_floor_textures))
+            if choice < n_floor_colors:
+                _composite(output, floor[0], palette=self.floor_colors[choice])
+                return Image.fromarray(output), "color"
+
+            asset = self.floor_textures[choice - n_floor_colors]
+            if self.random_placement:
+                placement = self._random_pose()
+            else:
+                _, placement = self._placement(entry, "floor")
+            mask, projection = floor
+            matrix = np.frombuffer(projection, dtype="<f4").reshape(3, 3)
+            if self.floor_texture_prefilter:
+                texture = _filtered_floor_texture(asset, matrix, image.size, placement, mask)
+            else:
+                texture = _repeating_texture(_texture(asset), matrix, image.size, placement)
+            _composite(output, mask, texture=texture)
+            return Image.fromarray(output), "table_color_floor_texture"
+
         if draw < self.color_probability:
-            if table is None:
+            if not self._valid_table(table):
                 return image, "empty_table_mask"
             output = np.array(image.convert("RGB"))
             _composite(output, table[0], palette=self.colors[np.random.randint(len(self.colors))])
@@ -216,10 +306,16 @@ class TableAppearance:
         floor = None
         if self.floor_cache is not None:
             floor = _surface_frame(self.floor_cache, entry, row, image.size, "floor")
-        if table is None and floor is None:
+        if not self._valid_table(table) and (self.min_table_area_fraction > 0 or floor is None):
             return image, "empty_table_mask"
         output = np.array(image.convert("RGB"))
-        for surface, frame in (("table", table), ("floor", floor)):
+        surfaces = []
+        if self.textures:
+            surfaces.append(("table", table if self._valid_table(table) else None))
+        if self.floor_textures:
+            surfaces.append(("floor", floor))
+        applied = set()
+        for surface, frame in surfaces:
             if frame is None:
                 continue
             mask, projection = frame
@@ -230,9 +326,14 @@ class TableAppearance:
             else:
                 texture = _repeating_texture(_texture(asset), matrix, image.size, placement)
             _composite(output, mask, texture=texture)
+            applied.add(surface)
 
-        if floor is None:
-            appearance = "texture"
+        if not applied:
+            return image, "empty_table_mask"
+        if applied == {"table", "floor"}:
+            appearance = "table_floor_texture"
+        elif applied == {"floor"}:
+            appearance = "floor_texture"
         else:
-            appearance = "floor_texture" if table is None else "table_floor_texture"
+            appearance = "texture"
         return Image.fromarray(output), appearance

@@ -93,11 +93,21 @@ def main():
     data.head_camera = data.get("head_camera", "front_head")
     recolor_surfaces(data.head_camera)
     table_appearance = data.get("table_appearance")
-    if table_appearance is not None and table_appearance.texture_probability > 0:
-        resolve_table_textures(table_appearance.get("textures", ()))
-        if table_appearance.get("floor_textures"):
-            resolve_floor_textures(table_appearance.floor_textures)
-    if recolor_probability > 0 or (table_appearance and table_appearance.color_probability > 0):
+    ta_has_color = False
+    if table_appearance is not None:
+        unified_prob = table_appearance.get("unified_probability")
+        ta_has_color = bool(unified_prob) or float(table_appearance.get("color_probability", 0)) > 0
+        ta_has_texture = bool(unified_prob) or float(table_appearance.get("texture_probability", 0)) > 0
+        if ta_has_texture:
+            ta_textures = table_appearance.get("textures") or ()
+            ta_floor_textures = table_appearance.get("floor_textures") or ()
+            if ta_textures:
+                resolve_table_textures(ta_textures)
+            if ta_floor_textures:
+                resolve_floor_textures(ta_floor_textures)
+            if not unified_prob and not ta_textures and not ta_floor_textures:
+                raise ValueError("table_appearance requires textures or floor_textures when texture_probability > 0.")
+    if recolor_probability > 0 or ta_has_color:
         resolved_palettes = resolve_training_palettes(data)
         data.background_recolor_palettes = list(resolved_palettes)
         data.background_recolor_resolved_palettes = resolved_palettes
