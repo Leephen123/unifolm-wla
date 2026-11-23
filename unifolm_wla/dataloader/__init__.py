@@ -6,7 +6,7 @@ import torch.distributed as dist
 
 def build_dataloader(cfg, dataset_py="single_source_datasets"):
     """Single entry point for building the VLA training dataloader."""
-    if dataset_py == "full_pipeline":
+    if dataset_py in ("full_pipeline", "mpds"):
         from .full_pipeline import build_full_pipeline_dataloader
         return build_full_pipeline_dataloader(cfg)
     from accelerate.logging import get_logger
@@ -16,7 +16,7 @@ def build_dataloader(cfg, dataset_py="single_source_datasets"):
     if dataset_py not in ("multi_source_datasets", "single_source_datasets"):
         raise ValueError(
             f"Unsupported dataset_py={dataset_py!r}; expected "
-            "'single_source_datasets' or 'multi_source_datasets'."
+            "'full_pipeline', 'mpds', 'single_source_datasets', or 'multi_source_datasets'."
         )
 
     msd_cfg = cfg.datasets.vla_data

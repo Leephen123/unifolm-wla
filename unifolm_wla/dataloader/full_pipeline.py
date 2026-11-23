@@ -249,14 +249,18 @@ class FullPipelineDataset(Dataset):
     def __init__(self, manifest_path, statistics_path, history_frames=0, *,
                  background_recolor=False, prompt_mode=None,
                  background_recolor_probability=DEFAULT_BACKGROUND_RECOLOR_PROBABILITY,
-                 head_camera="front_head", recolor_palettes=None, table_appearance=None):
+                 head_camera="front_head", recolor_palettes=None, table_appearance=None,
+                 mpds_feature_map=None):
         manifest = json.loads(Path(manifest_path).read_text())
         self.episodes = manifest["episodes"]
         self.head_camera = head_camera
         self.cameras = cameras_for_head(head_camera)
+        self.mpds_feature_map = dict(mpds_feature_map) if mpds_feature_map is not None else None
         if manifest.get("head_camera", head_camera) != head_camera:
             raise ValueError(f"Training manifest does not match head camera {head_camera}.")
         for entry in self.episodes:
+            if "mpds_path" in entry:
+                continue
             if head_camera not in entry["videos"]:
                 raise ValueError(f"Training manifest lacks {head_camera}: {entry['dataset']} episode "
                                  f"{entry['episode_index']}.")
@@ -293,25 +297,53 @@ class FullPipelineDataset(Dataset):
         start = 0 if episode_id == 0 else int(self.ends[episode_id - 1])
         entry = self.episodes[episode_id]
         row = entry["valid_rows"][index - start]
-        parquet = entry.get("state_valid_parquet")
-        if parquet:
-            row_states, action, row_state_valid, row_action_valid = read_state_valid_row(parquet, row)
-            if not row_action_valid:
-                raise ValueError(f"Manifest selected invalid action row {row} in {parquet}")
-            raw_state = row_states[-1]
+        mpds_path = entry.get("mpds_path")
+        mpds_hist_raw = None
+        mpds_hist_valid = None
+        mpds_prompt = None
+        if mpds_path:
+            from .mpds_backend import read_mpds_sample
+            feature_map = entry.get("mpds_feature_map") or self.mpds_feature_map
+            (
+                images,
+                raw_state,
+                state_ok,
+                action,
+                mpds_hist_raw,
+                mpds_hist_valid,
+                mpds_prompt,
+            ) = read_mpds_sample(
+                mpds_path,
+                row,
+                head_camera=self.head_camera,
+                history_frames=self.history_frames,
+                feature_map=feature_map,
+                row_timestamps=entry.get("row_timestamps"),
+                layout=entry.get("mpds_layout"),
+            )
+            parquet = None
         else:
-            z = load_body(entry["body"])
-            center = int(z["centers"][row])
-            raw_state = np.concatenate((z["arm_state"][center], z["hand_state"][center]))
-            indices = center + np.arange(1, 51)
-            action = np.concatenate((z["arm_actions"][indices], z["hand_actions"][indices]), axis=-1)
-        if parquet and not row_state_valid[-1]:
+            parquet = entry.get("state_valid_parquet")
+            if parquet:
+                row_states, action, row_state_valid, row_action_valid = read_state_valid_row(parquet, row)
+                if not row_action_valid:
+                    raise ValueError(f"Manifest selected invalid action row {row} in {parquet}")
+                raw_state = row_states[-1]
+                state_ok = bool(row_state_valid[-1])
+            else:
+                z = load_body(entry["body"])
+                center = int(z["centers"][row])
+                raw_state = np.concatenate((z["arm_state"][center], z["hand_state"][center]))
+                indices = center + np.arange(1, 51)
+                action = np.concatenate((z["arm_actions"][indices], z["hand_actions"][indices]), axis=-1)
+                state_ok = True
+            images = [read_frame(entry["videos"][key], row) for key, _ in self.cameras]
+        if not state_ok:
             state, state_mask = np.zeros(60, np.float32), np.zeros(60, bool)
         else:
             state, state_mask = pack_state((raw_state - self.so) / self.ss)
         action = ((action - self.ao) / self.asc).astype(np.float32)
         assert action.shape == (50, 114) and np.isfinite(action).all()
-        images = [read_frame(entry["videos"][key], row) for key, _ in self.cameras]
         probability = self.background_recolor_probability
         if self.table_appearance is not None:
             images[0], appearance = self.table_appearance(images[0], entry, row)
@@ -320,15 +352,19 @@ class FullPipelineDataset(Dataset):
             images[0] = recolor_head(images[0], entry["background_masks_parquet"], row,
                                      self.head_camera, self.recolor_palettes)
         images = [pad_resize(image) for image in images]
+        default_prompt = mpds_prompt or self.prompt
         example = {"image": images, "image_roles": [role for _, role in self.cameras],
-                "lang": self.prompt, "state": state, "state_mask": state_mask,
+                "lang": default_prompt, "state": state, "state_mask": state_mask,
                 "action": action, "action_mask": np.ones(114, dtype=bool),
                 "arm_type": "dual_with_legs", "robot_type": "unitree"}
         if self.table_appearance is not None:
             example["table_appearance"] = appearance
         if self.history_frames:
             from .state_history import history_rows, pack_history
-            if parquet:
+            if mpds_path:
+                raw = mpds_hist_raw
+                valid = mpds_hist_valid
+            elif parquet:
                 history_slots = PARQUET_HISTORY_SLOTS[row_states.shape[0]]
                 raw = row_states[history_slots]
                 valid = row_state_valid[history_slots]
@@ -339,7 +375,7 @@ class FullPipelineDataset(Dataset):
             example['state_history'], example['state_history_mask'] = pack_history(raw, valid, self.so, self.ss)
             draw = 0.0 if self.prompt_mode == 'full_only' else np.random.random()
             if draw < .5:
-                source, prompt = 'full', self.prompt
+                source, prompt = 'full', default_prompt
             elif draw < .75:
                 source, prompt = 'scene', entry['scene_prompt']
             else:
@@ -366,6 +402,10 @@ def build_full_pipeline_dataloader(cfg):
     if data.get("table_appearance") is not None:
         from .table_appearance import TableAppearance
         table_appearance = TableAppearance(data, manifest, cfg.seed)
+    mpds_feature_map = data.get("mpds_feature_map")
+    if mpds_feature_map is not None:
+        from omegaconf import OmegaConf
+        mpds_feature_map = OmegaConf.to_container(mpds_feature_map, resolve=True)
     dataset = FullPipelineDataset(
         manifest, data.statistics_path, data.get("history_frames", 0),
         background_recolor=probability > 0,
@@ -374,6 +414,7 @@ def build_full_pipeline_dataloader(cfg):
         recolor_palettes=resolve_training_palettes(data) if probability > 0 else None,
         prompt_mode=data.get("prompt_mode"),
         table_appearance=table_appearance,
+        mpds_feature_map=mpds_feature_map,
     )
     # Accelerate shards the ordinary dataloader exactly once across ranks.
     loader_kwargs = dict(

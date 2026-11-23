@@ -111,7 +111,45 @@ class SurfaceTracking:
         return None
 
 
-def _write_episode(db, episode, video_path, masks_path, stats, surface):
+def _iter_gray_frames(video_source, frames):
+    kind, path, feature_map = video_source
+    if kind == "mpds":
+        from mpds.dataset import MPDataset
+        from mpds.device import mp_use_device
+        from unifolm_wla.dataloader.mpds_backend import resolve_mpds_schema
+        with mp_use_device(num_threads=1):
+            with MPDataset.open(path) as ds:
+                schema = resolve_mpds_schema(ds.metadata, head_camera="front_head", feature_map=feature_map)
+                head_key = schema["front_head"]
+                count = 0
+                for row, (_ts, item) in enumerate(ds.select([head_key]).enumerate()):
+                    if row >= frames:
+                        raise ValueError(f"MPDS frame count exceeds mask count ({frames}): {path}.")
+                    rgb = np.asarray(item[head_key], dtype=np.uint8)
+                    size = (rgb.shape[1], rgb.shape[0])
+                    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                    yield row, size, gray
+                    count += 1
+                if count != frames:
+                    raise ValueError(f"Decoded {count} of {frames} MPDS frames: {path}.")
+        return
+    with av.open(path) as video:
+        stream, = video.streams.video
+        stream.codec_context.thread_count = 1
+        if stream.frames != frames or stream.average_rate != 20:
+            raise ValueError(f"Video and mask metadata do not agree: {path}.")
+        size = stream.width, stream.height
+        count = 0
+        for row, frame in enumerate(video.decode(stream)):
+            if row >= frames or frame.pts * frame.time_base != row / stream.average_rate:
+                raise ValueError(f"Video timestamp mismatch at {row}: {path}.")
+            yield row, size, frame.to_ndarray(format="gray")
+            count += 1
+        if count != frames:
+            raise ValueError(f"Decoded {count} of {frames} frames: {path}.")
+
+
+def _write_episode(db, episode, video_source, masks_path, stats, surface):
     masks = pq.read_table(masks_path, columns=["frame_index", *MASKS], use_threads=False)
     frames = len(masks)
     if not np.array_equal(masks["frame_index"].to_numpy(), np.arange(frames)):
@@ -120,33 +158,25 @@ def _write_episode(db, episode, video_path, masks_path, stats, surface):
     tracking = SurfaceTracking(surface)
     trims = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
     records = []
-    with av.open(video_path) as video:
-        stream, = video.streams.video
-        stream.codec_context.thread_count = 1
-        if stream.frames != frames or stream.average_rate != 20:
-            raise ValueError(f"Video and mask metadata do not agree: {video_path}.")
-        size = stream.width, stream.height
-        for row, frame in enumerate(video.decode(stream)):
-            if row >= frames or frame.pts * frame.time_base != row / stream.average_rate:
-                raise ValueError(f"Video timestamp mismatch at {row}: {video_path}.")
-            table, floor, clothes, pants, arm = [_decode_mask(col[row].as_py(), size) for col in columns]
-            foreground = clothes | pants | arm
-            selected = table & ~floor if surface == "table" else floor & ~table
-            selected &= ~foreground
-            if selected.any():
-                if surface == "table":
-                    # Remove narrow mask extensions onto table legs.
-                    opened = cv2.morphologyEx(selected.astype(np.uint8), cv2.MORPH_OPEN, trims).astype(bool)
-                    if opened.sum() >= 0.88 * selected.sum():
-                        selected = opened
-                packed = zlib.compress(np.packbits(selected).tobytes(), 1)
-            else:
-                packed = None
-                stats[f"empty_{surface}_mask"] += 1
-            projection = tracking.project(frame.to_ndarray(format="gray"), selected, ~foreground)
-            records.append((episode, row, packed, projection))
+    for row, size, gray in _iter_gray_frames(video_source, frames):
+        table, floor, clothes, pants, arm = [_decode_mask(col[row].as_py(), size) for col in columns]
+        foreground = clothes | pants | arm
+        selected = table & ~floor if surface == "table" else floor & ~table
+        selected &= ~foreground
+        if selected.any():
+            if surface == "table":
+                # Remove narrow mask extensions onto table legs.
+                opened = cv2.morphologyEx(selected.astype(np.uint8), cv2.MORPH_OPEN, trims).astype(bool)
+                if opened.sum() >= 0.88 * selected.sum():
+                    selected = opened
+            packed = zlib.compress(np.packbits(selected).tobytes(), 1)
+        else:
+            packed = None
+            stats[f"empty_{surface}_mask"] += 1
+        projection = tracking.project(gray, selected, ~foreground)
+        records.append((episode, row, packed, projection))
     if len(records) != frames:
-        raise ValueError(f"Decoded {len(records)} of {frames} frames: {video_path}.")
+        raise ValueError(f"Decoded {len(records)} of {frames} frames: {video_source[1]}.")
     db.executemany("INSERT INTO frames VALUES (?, ?, ?, ?)", records)
     stats.update(tracking.stats)
     stats.update(episodes=1, frames=frames)
@@ -205,7 +235,11 @@ def main():
     digest = hashlib.sha256(manifest_bytes).hexdigest()
     groups = defaultdict(list)
     for entry in manifest["episodes"]:
-        groups[entry["dataset"]].append((entry["episode_index"], entry["videos"]["front_head"],
+        if "mpds_path" in entry:
+            source = ("mpds", entry["mpds_path"], entry.get("mpds_feature_map"))
+        else:
+            source = ("video", entry["videos"]["front_head"], None)
+        groups[entry["dataset"]].append((entry["episode_index"], source,
                                          entry["background_masks_parquet"]))
     # Preserve signatures for pre-existing tabletop caches.
     signature = f"{CACHE_VERSION}:{digest}" if args.surface == "table" else f"{CACHE_VERSION}:{digest}:floor"
