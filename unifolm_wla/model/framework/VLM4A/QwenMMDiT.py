@@ -66,6 +66,30 @@ def _adapt_multi_source_batch(batch: dict) -> list:
     return examples
 
 
+def _apply_state_augmentation(state: torch.Tensor, state_mask: Optional[torch.Tensor], training: bool) -> torch.Tensor:
+    if training:
+        batch_size = state.shape[0]
+        rand_vals = torch.rand((batch_size,) + (1,) * (state.ndim - 1), device=state.device)
+        is_zero = rand_vals < 0.1
+        is_noise = (rand_vals >= 0.1) & (rand_vals < 0.4)
+
+        if is_noise.any():
+            noise = torch.randn_like(state) * 0.1
+            if state_mask is not None:
+                noise = noise * (state_mask > 0).to(state.dtype)
+            state = torch.where(is_noise, state + noise, state)
+
+        if is_zero.any():
+            state = torch.where(is_zero, torch.zeros_like(state), state)
+            if state_mask is not None:
+                state_mask = torch.where(is_zero, torch.zeros_like(state_mask), state_mask)
+
+    if state_mask is not None:
+        state = torch.cat([state, state_mask], dim=-1)
+
+    return state.unsqueeze(1)
+
+
 def _build_state_tensor(examples: list, device, dtype, training: bool = True) -> Optional[torch.Tensor]:
     """Build state tensor (B, 1, state_dim) with optional mask concatenation.
 
@@ -227,6 +251,22 @@ class Qwen_MMDiT(baseframework):
         if not self._use_state_projector:
             return None
         device = self.qwen_vl_interface.model.device
+        prepacked = getattr(self, "_prepacked_tensors", None)
+        if prepacked is not None and "state" in prepacked:
+            state = prepacked["state"].to(device=device, dtype=torch.float32, non_blocking=True)
+            state_mask = prepacked.get("state_mask")
+            if state_mask is not None:
+                state_mask = state_mask.to(device=device, dtype=torch.float32, non_blocking=True)
+            if self.config.datasets.vla_data.get('history_frames', 0):
+                hist = prepacked["state_history"].to(device=device, dtype=torch.float32, non_blocking=True)
+                state = torch.cat((hist, state.unsqueeze(1)), dim=1)
+                if state_mask is not None:
+                    hist_mask = prepacked["state_history_mask"].to(device=device, dtype=torch.float32, non_blocking=True)
+                    state_mask = torch.cat((hist_mask, state_mask.unsqueeze(1)), dim=1)
+                out = _apply_state_augmentation(state, state_mask, training=self.training)
+                return out.squeeze(1).flatten(0, 1)
+            out = _apply_state_augmentation(state, state_mask, training=self.training)
+            return out.squeeze(1)
         if self.config.datasets.vla_data.get('history_frames', 0):
             examples = [dict(e, state=np.concatenate((e['state_history'], e['state'][None]), axis=0),
                              state_mask=np.concatenate((e['state_history_mask'], e['state_mask'][None]), axis=0))
@@ -243,9 +283,10 @@ class Qwen_MMDiT(baseframework):
     ) -> Tuple:
         if isinstance(examples, dict):
             examples = _adapt_multi_source_batch(examples)
+        prepacked = getattr(self, "_prepacked_tensors", None)
         batch_images = [example["image"] for example in examples]
         instructions = [example["lang"] for example in examples]
-        actions = [example["action"] for example in examples]
+        actions = None if (prepacked is not None and "action" in prepacked) else [example["action"] for example in examples]
 
         solutions = None
 
@@ -279,11 +320,21 @@ class Qwen_MMDiT(baseframework):
             keys_attn_mask = (~assistant_mask) & keys_attn_mask if keys_attn_mask is not None else ~assistant_mask
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
+            if prepacked is not None and "action" in prepacked:
+                actions = prepacked["action"].to(device=last_hidden.device, dtype=last_hidden.dtype, non_blocking=True)
+            else:
+                actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
             actions_target = actions[:, -self.action_horizon :, :]
 
             action_mask = None
-            if "action_mask" in examples[0]:
+            if prepacked is not None and "action_mask" in prepacked:
+                action_mask = prepacked["action_mask"].to(
+                    device=last_hidden.device, dtype=last_hidden.dtype, non_blocking=True
+                )
+                actions_target = torch.cat(
+                    [actions_target, action_mask.unsqueeze(1).expand_as(actions_target)], dim=2
+                )
+            elif "action_mask" in examples[0]:
                 action_mask = torch.tensor(
                     np.array([e["action_mask"] for e in examples]),
                     device=last_hidden.device, dtype=last_hidden.dtype,
@@ -366,8 +417,13 @@ class Qwen_MMDiT(baseframework):
             else _build_state_tensor(examples, last_hidden.device, last_hidden.dtype, training=self.training)
         )
 
+        prepacked = getattr(self, "_prepacked_tensors", None)
         action_mask = None
-        if "action_mask" in examples[0]:
+        if prepacked is not None and "action_mask" in prepacked:
+            action_mask = prepacked["action_mask"].to(
+                device=last_hidden.device, dtype=last_hidden.dtype, non_blocking=True
+            )
+        elif "action_mask" in examples[0]:
             action_mask = torch.tensor(
                 np.array([e["action_mask"] for e in examples]),
                 device=last_hidden.device, dtype=last_hidden.dtype,

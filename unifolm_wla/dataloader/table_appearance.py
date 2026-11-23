@@ -161,6 +161,9 @@ class TableAppearance:
             raise ValueError("Table appearance requires front_head.")
         self.color_probability = float(config.color_probability)
         self.texture_probability = float(config.texture_probability)
+        self.floor_texture_prefilter = config.get("floor_texture_prefilter", True)
+        if type(self.floor_texture_prefilter) is not bool:
+            raise ValueError("floor_texture_prefilter must be a boolean.")
         self.total_probability = self.color_probability + self.texture_probability
         if not (self.color_probability >= 0 and self.texture_probability >= 0
                 and 0 < self.total_probability <= 1):
@@ -222,7 +225,7 @@ class TableAppearance:
             mask, projection = frame
             asset, placement = self._placement(entry, surface)
             matrix = np.frombuffer(projection, dtype="<f4").reshape(3, 3)
-            if surface == "floor":
+            if surface == "floor" and self.floor_texture_prefilter:
                 texture = _filtered_floor_texture(asset, matrix, image.size, placement, mask)
             else:
                 texture = _repeating_texture(_texture(asset), matrix, image.size, placement)

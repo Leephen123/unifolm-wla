@@ -58,6 +58,7 @@ def save_checkpoint(accelerator, model, out, step, epoch, batches_in_epoch):
 def main():
     # Spawned data workers import this module; keep model/DeepSpeed initialization
     # inside the training process so CPU video workers never create CUDA contexts.
+    torch.set_float32_matmul_precision("high")
     from examples.unifolm_wla.pytree_cycle_fix import install_cycle_free_pytree
     install_cycle_free_pytree()
     import wandb
@@ -79,6 +80,8 @@ def main():
     parser.add_argument("--random-init", action="store_true", help="Explicit random-weight capacity test; requires --smoke-steps")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--disable-checkpointing", action="store_true")
+    parser.add_argument("--gc-policy", choices=("full", "selective"), help="Gradient checkpointing policy")
+    parser.add_argument("--num-workers", type=int, help="Override configured dataloader num_workers")
     parser.add_argument("--resume")
     parser.add_argument("--validate-smoke", action="store_true", help="Run full validation at the final smoke step")
     args = parser.parse_args()
@@ -102,6 +105,8 @@ def main():
                        if args.batch_size is None else args.batch_size)
     args.output = args.output or cfg.output_dir
     cfg.datasets.vla_data.per_device_batch_size = args.batch_size
+    if args.num_workers is not None:
+        cfg.datasets.vla_data.num_workers = args.num_workers
     cfg.output_dir = args.output
     cfg.trainer.is_resume = bool(args.resume)
     assert not args.random_init
@@ -127,20 +132,57 @@ def main():
         OmegaConf.save(cfg, out / "config.yaml")
     accelerator.wait_for_everyone()
     model = build_framework(cfg)
-    loaded = load_base(model, cfg.trainer.pretrained_checkpoint)
+    resume_weights_only = False
+    if args.resume:
+        resume_dir = Path(args.resume)
+        assert (resume_dir / "COMPLETE").exists(), f"Incomplete checkpoint: {resume_dir}"
+        optim_shards = list((resume_dir / "pytorch_model").glob("*zero_pp_rank_*_optim_states.pt"))
+        if len(optim_shards) != accelerator.num_processes:
+            resume_weights_only = True
+    if resume_weights_only:
+        from safetensors.torch import load_file
+        ckpt_weights = load_file(str(Path(args.resume) / "model.safetensors"))
+        res = model.load_state_dict(ckpt_weights, strict=True)
+        assert not res.missing_keys and not res.unexpected_keys
+        loaded = {
+            "loaded_tensors": len(ckpt_weights),
+            "reinitialized": {},
+            "resume_mode": f"weights_only_world_size_change({len(optim_shards)}->{accelerator.num_processes})",
+            "resumed_from": str(args.resume),
+        }
+    else:
+        loaded = load_base(model, cfg.trainer.pretrained_checkpoint)
     model.qwen_vl_interface.requires_grad_(not cfg.trainer.freeze_vlm)
     model.qwen_vl_interface.model.robot_state_projector.requires_grad_(True)
+    gc_policy = args.gc_policy or cfg.trainer.get("gradient_checkpointing_policy", "selective")
+    vlm = model.qwen_vl_interface.model.model
     if cfg.trainer.gradient_checkpointing:
         model.qwen_vl_interface.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if gc_policy == "full":
+            model.action_model.model.enable_gradient_checkpointing()
+        elif gc_policy == "selective":
+            # Keep VLM vision+language layers checkpointed and checkpoint half (8/16) of the
+            # MMDiT blocks (~13GB extra activation memory -> ~67GB peak with validation runtime).
+            model.action_model.model.enable_gradient_checkpointing()
+            for idx, block in enumerate(model.action_model.model.transformer_blocks):
+                block.gradient_checkpointing = (idx % 2 == 0)
+        else:
+            raise ValueError(f"Unknown gradient_checkpointing_policy: {gc_policy!r}")
     model.qwen_vl_interface.model.config.use_cache = False
-    if cfg.trainer.gradient_checkpointing:
-        model.action_model.model.enable_gradient_checkpointing()
-    vlm = model.qwen_vl_interface.model.model
+    dit_gc_blocks = sum(
+        bool(getattr(b, "gradient_checkpointing", model.action_model.model.gradient_checkpointing))
+        for b in model.action_model.model.transformer_blocks
+    )
     loaded["gradient_checkpointing"] = {
+        "policy": gc_policy if cfg.trainer.gradient_checkpointing else "disabled",
         "vision_blocks": sum(layer.gradient_checkpointing for layer in vlm.visual.blocks),
         "language_layers": sum(layer.gradient_checkpointing for layer in vlm.language_model.layers),
-        "action_expert": bool(model.action_model.model.gradient_checkpointing)}
-    assert loaded["gradient_checkpointing"] == {"vision_blocks": 24, "language_layers": 36, "action_expert": True}
+        "action_expert_blocks": dit_gc_blocks,
+        "action_expert": bool(dit_gc_blocks > 0)}
+    if cfg.trainer.gradient_checkpointing and gc_policy == "full":
+        assert loaded["gradient_checkpointing"] == {
+            "policy": "full", "vision_blocks": 24, "language_layers": 36, "action_expert_blocks": 16, "action_expert": True
+        }
     from examples.unifolm_wla.training_fusion import apply_candidate
     from examples.unifolm_wla.training_worker_inputs import use_worker_inputs, CPUInputsCollator
     apply_candidate(model, "blocks")
@@ -188,8 +230,12 @@ def main():
         resume = Path(args.resume)
         assert (resume / "COMPLETE").exists()
         progress = json.loads((resume / "progress.json").read_text())
-        accelerator.load_state(str(resume))
         step, epoch, batches_in_epoch = progress["step"], progress["epoch"], progress["batches_in_epoch"]
+        if resume_weights_only:
+            for _ in range(step):
+                scheduler.step()
+        else:
+            accelerator.load_state(str(resume))
     run = None
     if accelerator.is_main_process and not args.smoke_steps:
         wandb_mode = os.environ.get("WANDB_MODE", "offline")
@@ -220,7 +266,8 @@ def main():
                 f.write(json.dumps(result) + "\n")
             if run:
                 run.log(result)
-            prune_checkpoints(out)
+            if (out / 'checkpoints').is_dir():
+                prune_checkpoints(out)
 
     max_steps = args.smoke_steps or cfg.trainer.max_train_steps
     records = []
@@ -241,6 +288,9 @@ def main():
         loader.set_epoch(epoch)
         current_loader = accelerator.skip_first_batches(loader, batches_in_epoch) if batches_in_epoch else loader
         last_end = time.perf_counter()
+        window_data_seconds = 0.0
+        window_model_seconds = 0.0
+        window_steps = 0
         for batch in current_loader:
             if validation:
                 log_validation(validation.poll())
@@ -249,55 +299,75 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.profiler.record_function("training_forward"), accelerator.autocast():
                 loss = model(batch)["action_loss"]
-            assert torch.isfinite(loss), "nonfinite loss"
             with torch.profiler.record_function("backward_and_zero_optimizer"):
                 accelerator.backward(loss)
             grad_norm = model.get_global_grad_norm()
             optimizer.step()
             scheduler.step()
-            torch.cuda.synchronize()
             step += 1
             batches_in_epoch += 1
-            loss_mean = accelerator.reduce(loss.detach().float(), reduction="mean").item()
-            model_seconds = time.perf_counter() - started
-            local_timing = torch.tensor([data_seconds, model_seconds, data_seconds + model_seconds], device=accelerator.device)
-            all_timing = accelerator.gather(local_timing[None])
-            maximum_timing = all_timing.max(dim=0).values.cpu().tolist()
-            memory_stats = torch.cuda.memory_stats_as_nested_dict()
-            record = {"step": step, "time_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                      "loss": loss_mean, "grad_norm": float(grad_norm),
-                      "learning_rate": scheduler.get_last_lr()[0], "step_seconds": maximum_timing[2],
-                      "data_seconds": maximum_timing[0], "model_seconds": maximum_timing[1],
-                      "samples_per_second": args.batch_size * accelerator.num_processes / maximum_timing[2],
-                      "batch_per_device": args.batch_size, "world_size": accelerator.num_processes,
-                      "global_batch": args.batch_size * accelerator.num_processes,
-                      "peak_allocated_bytes": memory_stats["allocated_bytes"]["all"]["peak"],
-                      "peak_reserved_bytes": memory_stats["reserved_bytes"]["all"]["peak"]}
-            assert np.isfinite(record["grad_norm"]), record
             if cfg.datasets.vla_data.get('history_frames', 0):
                 names = ['full', 'scene', 'caption', 'caption_missing_scene']
                 for example in batch['examples']:
                     prompt_counts[names.index(example['prompt_source'])] += 1
-                if step == 1 or step % cfg.trainer.logging_frequency == 0:
-                    counts = accelerator.reduce(torch.tensor(prompt_counts, device=accelerator.device), reduction='sum').cpu().tolist()
-                    record.update({f'prompt/{name}_fraction':count/sum(counts) for name,count in zip(names,counts)})
             if table_appearance is not None:
                 for example in batch["examples"]:
                     appearance_counts[TABLE_APPEARANCES.index(example["table_appearance"])] += 1
-                if step == 1 or step % cfg.trainer.logging_frequency == 0:
-                    counts = accelerator.reduce(torch.tensor(appearance_counts, device=accelerator.device),
-                                                reduction="sum").cpu().tolist()
-                    record.update({
-                        f"table_appearance/{name}_fraction": count / sum(counts)
-                        for name, count in zip(TABLE_APPEARANCES, counts, strict=True)
-                    })
-            records.append(record)
-            if accelerator.is_main_process:
-                print(json.dumps(record), flush=True)
-                with (out / "metrics.jsonl").open("a") as f:
-                    f.write(json.dumps(record) + "\n")
-                if run and (step == 1 or step % cfg.trainer.logging_frequency == 0):
-                    run.log(record)
+            is_sync_step = (
+                bool(args.smoke_steps)
+                or step == 1
+                or step % cfg.trainer.logging_frequency == 0
+                or step == max_steps
+                or step % cfg.trainer.save_interval == 0
+            )
+            if is_sync_step:
+                torch.cuda.synchronize()
+            model_seconds = time.perf_counter() - started
+            window_data_seconds += data_seconds
+            window_model_seconds += model_seconds
+            window_steps += 1
+            if is_sync_step:
+                loss_val = loss.detach().float()
+                assert torch.isfinite(loss_val), "nonfinite loss"
+                loss_mean = accelerator.reduce(loss_val, reduction="mean").item()
+                avg_data = window_data_seconds / window_steps
+                avg_model = window_model_seconds / window_steps
+                local_timing = torch.tensor([avg_data, avg_model, avg_data + avg_model], device=accelerator.device)
+                all_timing = accelerator.gather(local_timing[None])
+                maximum_timing = all_timing.max(dim=0).values.cpu().tolist()
+                window_data_seconds = 0.0
+                window_model_seconds = 0.0
+                window_steps = 0
+                memory_stats = torch.cuda.memory_stats_as_nested_dict()
+                record = {"step": step, "time_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                          "loss": loss_mean, "grad_norm": float(grad_norm),
+                          "learning_rate": scheduler.get_last_lr()[0], "step_seconds": maximum_timing[2],
+                          "data_seconds": maximum_timing[0], "model_seconds": maximum_timing[1],
+                          "samples_per_second": args.batch_size * accelerator.num_processes / maximum_timing[2],
+                          "batch_per_device": args.batch_size, "world_size": accelerator.num_processes,
+                          "global_batch": args.batch_size * accelerator.num_processes,
+                          "peak_allocated_bytes": memory_stats["allocated_bytes"]["all"]["peak"],
+                          "peak_reserved_bytes": memory_stats["reserved_bytes"]["all"]["peak"]}
+                assert np.isfinite(record["grad_norm"]), record
+                if cfg.datasets.vla_data.get('history_frames', 0):
+                    if step == 1 or step % cfg.trainer.logging_frequency == 0:
+                        counts = accelerator.reduce(torch.tensor(prompt_counts, device=accelerator.device), reduction='sum').cpu().tolist()
+                        record.update({f'prompt/{name}_fraction':count/sum(counts) for name,count in zip(names,counts)})
+                if table_appearance is not None:
+                    if step == 1 or step % cfg.trainer.logging_frequency == 0:
+                        counts = accelerator.reduce(torch.tensor(appearance_counts, device=accelerator.device),
+                                                    reduction="sum").cpu().tolist()
+                        record.update({
+                            f"table_appearance/{name}_fraction": count / sum(counts)
+                            for name, count in zip(TABLE_APPEARANCES, counts, strict=True)
+                        })
+                records.append(record)
+                if accelerator.is_main_process:
+                    print(json.dumps(record), flush=True)
+                    with (out / "metrics.jsonl").open("a") as f:
+                        f.write(json.dumps(record) + "\n")
+                    if run and (step == 1 or step % cfg.trainer.logging_frequency == 0):
+                        run.log(record)
             if not args.smoke_steps and (step % cfg.trainer.save_interval == 0 or step == max_steps):
                 save_checkpoint(accelerator, model, out, step, epoch, batches_in_epoch)
             if validation and (step % cfg.validation.interval == 0 or step == max_steps):

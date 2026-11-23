@@ -63,6 +63,84 @@ PARQUET_HISTORY_SLOTS = {
 }
 
 
+_parquet_files = OrderedDict()
+
+
+def _parquet_file(path):
+    import pyarrow.parquet as pq
+
+    cached = _parquet_files.get(path)
+    if cached is not None:
+        _parquet_files.move_to_end(path)
+        return cached
+    if len(_parquet_files) == 32:
+        _parquet_files.popitem(last=False)
+    pf = pq.ParquetFile(path)
+    meta = pf.metadata
+    rg_ends = np.cumsum([meta.row_group(i).num_rows for i in range(meta.num_row_groups)])
+    entry = (pf, rg_ends)
+    _parquet_files[path] = entry
+    return entry
+
+
+def read_state_valid_row(path, row):
+    """Read and validate a single row from a state-valid Parquet file via its row group."""
+    import pyarrow as pa
+
+    pf, rg_ends = _parquet_file(path)
+    if len(rg_ends) == 0 or row < 0 or row >= int(rg_ends[-1]):
+        raise ValueError(f"Row {row} out of range for state-valid episode: {path}")
+    rg_idx = int(np.searchsorted(rg_ends, row, side="right"))
+    rg_start = 0 if rg_idx == 0 else int(rg_ends[rg_idx - 1])
+    local = row - rg_start
+    columns = ["arm_state", "hand_state", "arm_actions", "hand_actions", "state_valid", "action_valid"]
+    table = pf.read_row_group(rg_idx, columns=columns)
+    row_table = table.slice(local, 1)
+
+    av_col = row_table["action_valid"].combine_chunks()
+    if pa.types.is_boolean(av_col.type):
+        if av_col.null_count:
+            raise ValueError(f"Null in action_valid: {path}")
+        action_valid = bool(av_col[0].as_py())
+    else:
+        if av_col.null_count or av_col.values.null_count or len(av_col[0].values) != 1:
+            raise ValueError(f"Invalid action_valid in {path}")
+        action_valid = bool(av_col[0].values[0].as_py())
+
+    sv_scalar = row_table["state_valid"].combine_chunks()[0]
+    if not sv_scalar.is_valid or not hasattr(sv_scalar, "values"):
+        raise ValueError(f"Expected a per-state validity list in {path}")
+    sv_vals = sv_scalar.values
+    if sv_vals.null_count or not pa.types.is_boolean(sv_vals.type):
+        raise ValueError(f"Expected non-null boolean state_valid in {path}")
+    state_valid = sv_vals.to_numpy(zero_copy_only=False).astype(bool, copy=False)
+    state_steps = len(state_valid)
+    if state_steps not in PARQUET_HISTORY_SLOTS:
+        raise ValueError(f"Expected 100 or 200 state slots, got {state_steps}: {path}")
+
+    def extract(key, width):
+        col = row_table[key].combine_chunks()
+        scalar = col[0]
+        if not scalar.is_valid or not hasattr(scalar, "values"):
+            raise ValueError(f"Expected a list column {key} in {path}")
+        vals = scalar.values
+        if len(vals) != width or vals.null_count:
+            raise ValueError(f"Invalid width or null in {key}: {path}")
+        return vals.to_numpy(zero_copy_only=False).astype(np.float64, copy=False)
+
+    states = np.concatenate((
+        extract("arm_state", state_steps * 35).reshape(state_steps, 35),
+        extract("hand_state", state_steps * 12).reshape(state_steps, 12),
+    ), axis=-1)
+    actions = np.concatenate((
+        extract("arm_actions", 5100).reshape(50, 102),
+        extract("hand_actions", 600).reshape(50, 12),
+    ), axis=-1)
+    if not np.isfinite(states).all() or not np.isfinite(actions).all():
+        raise ValueError(f"Nonfinite state or action in {path}")
+    return states, actions, state_valid, action_valid
+
+
 @lru_cache(maxsize=2)
 def load_state_valid_episode(path):
     import pyarrow as pa
@@ -118,7 +196,7 @@ def video_reader(path):
     if path in _video_readers:
         _video_readers.move_to_end(path)
         return _video_readers[path]
-    if len(_video_readers) == 6:
+    if len(_video_readers) == 24:
         _, oldest = _video_readers.popitem(last=False)
         oldest.close()
     container = av.open(path)
@@ -217,17 +295,17 @@ class FullPipelineDataset(Dataset):
         row = entry["valid_rows"][index - start]
         parquet = entry.get("state_valid_parquet")
         if parquet:
-            states, actions, state_valid, action_valid = load_state_valid_episode(parquet)
-            if not action_valid[row]:
+            row_states, action, row_state_valid, row_action_valid = read_state_valid_row(parquet, row)
+            if not row_action_valid:
                 raise ValueError(f"Manifest selected invalid action row {row} in {parquet}")
-            raw_state, action = states[row, -1], actions[row]
+            raw_state = row_states[-1]
         else:
             z = load_body(entry["body"])
             center = int(z["centers"][row])
             raw_state = np.concatenate((z["arm_state"][center], z["hand_state"][center]))
             indices = center + np.arange(1, 51)
             action = np.concatenate((z["arm_actions"][indices], z["hand_actions"][indices]), axis=-1)
-        if parquet and not state_valid[row, -1]:
+        if parquet and not row_state_valid[-1]:
             state, state_mask = np.zeros(60, np.float32), np.zeros(60, bool)
         else:
             state, state_mask = pack_state((raw_state - self.so) / self.ss)
@@ -251,9 +329,9 @@ class FullPipelineDataset(Dataset):
         if self.history_frames:
             from .state_history import history_rows, pack_history
             if parquet:
-                history_slots = PARQUET_HISTORY_SLOTS[states.shape[1]]
-                raw = states[row, history_slots]
-                valid = state_valid[row, history_slots]
+                history_slots = PARQUET_HISTORY_SLOTS[row_states.shape[0]]
+                raw = row_states[history_slots]
+                valid = row_state_valid[history_slots]
             else:
                 rows, valid = history_rows(row)
                 history_centers = z['centers'][rows]
@@ -298,7 +376,15 @@ def build_full_pipeline_dataloader(cfg):
         table_appearance=table_appearance,
     )
     # Accelerate shards the ordinary dataloader exactly once across ranks.
-    return DataLoader(dataset, batch_size=data.per_device_batch_size, shuffle=True,
-                      num_workers=data.num_workers, collate_fn=collate_examples,
-                      drop_last=True, persistent_workers=data.num_workers > 0,
-                      multiprocessing_context="spawn" if data.num_workers > 0 else None)
+    loader_kwargs = dict(
+        batch_size=data.per_device_batch_size,
+        shuffle=True,
+        num_workers=data.num_workers,
+        collate_fn=collate_examples,
+        drop_last=True,
+        persistent_workers=data.num_workers > 0,
+        multiprocessing_context="spawn" if data.num_workers > 0 else None,
+    )
+    if data.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = int(data.get("prefetch_factor", 2))
+    return DataLoader(dataset, **loader_kwargs)

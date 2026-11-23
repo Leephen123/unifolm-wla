@@ -11,7 +11,7 @@ from .recolor_config import mask_fields
 LUMINANCE = np.array((0.2126, 0.7152, 0.0722), dtype=np.float32)
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=16)
 def _mask_rows(parquet_path, fields):
     import pyarrow.parquet as pq
 

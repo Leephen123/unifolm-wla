@@ -76,7 +76,7 @@ datasets:
     background_recolor_manifest_path: ${oc.env:WLA_SOFA_PREPARED_DIR}/manifest_background_masks_tracked.json
     statistics_path: ${oc.env:WLA_SOFA_PREPARED_DIR}/dataset_statistics.json
     per_device_batch_size: 64
-    num_workers: 2
+    num_workers: 6
     prompt_mode: full_only
     history_frames: 50
     history_seconds: 5

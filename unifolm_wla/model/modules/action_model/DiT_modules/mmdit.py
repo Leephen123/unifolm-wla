@@ -586,7 +586,7 @@ class DiT(ModelMixin, ConfigMixin):
                                 temb=temb, txt_temb=txt_temb,
                                 image_rotary_emb=image_rotary_emb,
                                 attention_mask=attention_mask)
-            if self.training and self.gradient_checkpointing:
+            if self.training and getattr(block, 'gradient_checkpointing', self.gradient_checkpointing):
                 from torch.utils.checkpoint import checkpoint
                 encoder_hidden_states, hidden_states = checkpoint(
                     block, hidden_states, use_reentrant=False, **block_kwargs)

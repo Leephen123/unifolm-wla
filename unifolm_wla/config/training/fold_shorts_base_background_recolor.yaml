@@ -60,7 +60,7 @@ datasets:
     background_recolor_manifest_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove_10hz/manifest_background_masks_tracked.json
     statistics_path: /storage/wangdonglinLab/weizhenyu/liyifan/unifolm-wla/dataset/prepared/fold_shorts_old_glove_10hz/dataset_statistics.json
     per_device_batch_size: 64
-    num_workers: 2
+    num_workers: 6
     prompt_mode: full_only
     history_frames: 50
     history_seconds: 5
