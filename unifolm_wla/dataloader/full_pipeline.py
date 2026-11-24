@@ -394,7 +394,7 @@ def collate_examples(batch):
     return batch
 
 
-def build_full_pipeline_dataloader(cfg):
+def build_full_pipeline_dataloader(cfg, collate_fn=None):
     data = cfg.datasets.vla_data
     assert list(data.image_size_wh) == [448, 320]
     manifest, probability = resolve_training_data(data)
@@ -421,7 +421,7 @@ def build_full_pipeline_dataloader(cfg):
         batch_size=data.per_device_batch_size,
         shuffle=True,
         num_workers=data.num_workers,
-        collate_fn=collate_examples,
+        collate_fn=collate_examples if collate_fn is None else collate_fn,
         drop_last=True,
         persistent_workers=data.num_workers > 0,
         multiprocessing_context="spawn" if data.num_workers > 0 else None,

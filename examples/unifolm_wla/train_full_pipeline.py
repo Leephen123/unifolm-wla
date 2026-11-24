@@ -35,6 +35,10 @@ def load_base(model, path):
 
 def save_checkpoint(accelerator, model, out, step, epoch, batches_in_epoch):
     from safetensors.torch import save_file
+    bare = accelerator.unwrap_model(model)
+    if getattr(bare, "_has_zero_sync_fwd", False):
+        from examples.unifolm_wla.fp8_opt import flush_pending_weight_gather
+        flush_pending_weight_gather(model)
     folder = out / "checkpoints" / str(step)
     # All ranks participate: this saves ZeRO optimizer partitions and RNG state.
     accelerator.save_state(str(folder), safe_serialization=True)
@@ -84,6 +88,7 @@ def main():
     parser.add_argument("--num-workers", type=int, help="Override configured dataloader num_workers")
     parser.add_argument("--resume")
     parser.add_argument("--validate-smoke", action="store_true", help="Run full validation at the final smoke step")
+    parser.add_argument("--fp8-opt", action="store_true", help="Enable SM90 native FP8 training optimization suite (fp8_opt)")
     args = parser.parse_args()
     cfg = OmegaConf.load(args.config)
     data = cfg.datasets.vla_data
@@ -128,8 +133,34 @@ def main():
     assert cfg.trainer.train_robot_state_projector
     assert cfg.trainer.save_format == "safetensors"
     assert 0 < cfg.trainer.max_train_steps <= 50000
-    plugin = DeepSpeedPlugin(zero_stage=2, gradient_accumulation_steps=1,
-                            gradient_clipping=cfg.trainer.gradient_clipping)
+    use_fp8_opt = bool(args.fp8_opt or cfg.get("training_optimization") == "fp8_opt")
+    if use_fp8_opt:
+        cfg.training_optimization = "fp8_opt"
+        ds_dict = {
+            "bf16": {"enabled": True},
+            "fp16": {"enabled": False},
+            "train_micro_batch_size_per_gpu": "auto",
+            "train_batch_size": "auto",
+            "gradient_accumulation_steps": 1,
+            "gradient_clipping": float(cfg.trainer.gradient_clipping),
+            "gradient_predivide_factor": 1.0,
+            "zero_optimization": {
+                "stage": 2,
+                "allgather_partitions": True,
+                "allgather_bucket_size": int(5e8),
+                "reduce_scatter": (os.environ.get("DS_REDUCE_SCATTER", "0") == "1"),
+                "reduce_bucket_size": int(os.environ.get("DS_BUCKET_SIZE", "500000000")),
+                "use_multi_rank_bucket_allreduce": (os.environ.get("DS_MULTI_RANK_ALLREDUCE", "0") == "1"),
+                "round_robin_gradients": (os.environ.get("DS_ROUND_ROBIN", "0") == "1"),
+                "overlap_comm": (os.environ.get("DS_OVERLAP_COMM", "1") == "1"),
+                "contiguous_gradients": True,
+                "cpu_offload": False,
+            },
+        }
+        plugin = DeepSpeedPlugin(hf_ds_config=ds_dict)
+    else:
+        plugin = DeepSpeedPlugin(zero_stage=2, gradient_accumulation_steps=1,
+                                gradient_clipping=cfg.trainer.gradient_clipping)
     accelerator = Accelerator(mixed_precision="bf16", gradient_accumulation_steps=1,
                               deepspeed_plugin=plugin,
                               dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True, data_seed=cfg.seed, non_blocking=True))
@@ -164,7 +195,7 @@ def main():
         loaded = load_base(model, cfg.trainer.pretrained_checkpoint)
     model.qwen_vl_interface.requires_grad_(not cfg.trainer.freeze_vlm)
     model.qwen_vl_interface.model.robot_state_projector.requires_grad_(True)
-    gc_policy = args.gc_policy or cfg.trainer.get("gradient_checkpointing_policy", "selective")
+    gc_policy = "full" if use_fp8_opt else (args.gc_policy or cfg.trainer.get("gradient_checkpointing_policy", "selective"))
     vlm = model.qwen_vl_interface.model.model
     if cfg.trainer.gradient_checkpointing:
         model.qwen_vl_interface.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -193,10 +224,33 @@ def main():
         assert loaded["gradient_checkpointing"] == {
             "policy": "full", "vision_blocks": 24, "language_layers": 36, "action_expert_blocks": 16, "action_expert": True
         }
-    from examples.unifolm_wla.training_fusion import apply_candidate
-    from examples.unifolm_wla.training_worker_inputs import use_worker_inputs, CPUInputsCollator
-    apply_candidate(model, "blocks")
-    use_worker_inputs(model)
+    if use_fp8_opt:
+        from examples.unifolm_wla.fp8_opt import (
+            FastWLAInputsCollator,
+            cache_all_fp8_weights,
+            clear_all_fp8_weights,
+            flush_pending_weight_gather,
+            install_fast_zero2_hooks,
+            install_fp8_training_optimizations,
+            install_zero_sync_forward,
+        )
+        fp8_report = install_fp8_training_optimizations(
+            model,
+            bwd_fast_accum=True,
+            use_cudnn_qwen_sdpa=(os.environ.get("WLA_QWEN_CUDNN_SDPA", "1") == "1"),
+            skip_last_txt_mlp=True,
+            compile_blocks=True,
+        )
+        install_zero_sync_forward(model)
+        if accelerator.is_main_process:
+            (out / "fp8-modules.json").write_text(json.dumps(fp8_report, indent=2))
+        collator = FastWLAInputsCollator(cfg, tight_seq=True, gpu_patch_unpack=True)
+    else:
+        from examples.unifolm_wla.training_fusion import apply_candidate
+        from examples.unifolm_wla.training_worker_inputs import use_worker_inputs, CPUInputsCollator
+        apply_candidate(model, "blocks")
+        use_worker_inputs(model)
+        collator = CPUInputsCollator(cfg)
     if args.profile and accelerator.is_main_process:
         def instrument(module, name):
             def enter(m, inputs):
@@ -226,10 +280,12 @@ def main():
     scheduler = get_scheduler(cfg.trainer.lr_scheduler_type, optimizer,
         num_warmup_steps=cfg.trainer.num_warmup_steps, num_training_steps=cfg.trainer.max_train_steps,
         scheduler_specific_kwargs=OmegaConf.to_container(cfg.trainer.scheduler_specific_kwargs))
-    loader = build_full_pipeline_dataloader(cfg)
-    loader.collate_fn = CPUInputsCollator(cfg)
+    loader = build_full_pipeline_dataloader(cfg, collate_fn=collator)
     loader.pin_memory = True
     model, optimizer, loader = accelerator.prepare(model, optimizer, loader)
+    bare_model = accelerator.unwrap_model(model)
+    if use_fp8_opt and os.environ.get("WLA_FAST_ZERO2", "1") == "1":
+        install_fast_zero2_hooks(model)
     accelerator.register_for_checkpointing(scheduler)
     set_seed(cfg.seed + accelerator.process_index)
     if accelerator.is_main_process:
@@ -307,22 +363,41 @@ def main():
             started = time.perf_counter()
             data_seconds = started - last_end
             optimizer.zero_grad(set_to_none=True)
+            if use_fp8_opt:
+                cache_all_fp8_weights(bare_model)
             with torch.profiler.record_function("training_forward"), accelerator.autocast():
                 loss = model(batch)["action_loss"]
             with torch.profiler.record_function("backward_and_zero_optimizer"):
                 accelerator.backward(loss)
-            grad_norm = model.get_global_grad_norm()
+            if not use_fp8_opt:
+                grad_norm = model.get_global_grad_norm()
             optimizer.step()
             scheduler.step()
+            if use_fp8_opt:
+                clear_all_fp8_weights(bare_model)
+                grad_norm = model.get_global_grad_norm()
             step += 1
             batches_in_epoch += 1
             if cfg.datasets.vla_data.get('history_frames', 0):
                 names = ['full', 'scene', 'caption', 'caption_missing_scene']
-                for example in batch['examples']:
-                    prompt_counts[names.index(example['prompt_source'])] += 1
+                if use_fp8_opt:
+                    ft = batch["fast_tensors"]
+                    if "prompt_counts_t" not in locals():
+                        prompt_counts_t = torch.zeros(4, dtype=torch.long, device=accelerator.device)
+                    prompt_counts_t.add_(ft["prompt_hist"])
+                else:
+                    for example in batch['examples']:
+                        prompt_counts[names.index(example['prompt_source'])] += 1
             if table_appearance is not None:
-                for example in batch["examples"]:
-                    appearance_counts[TABLE_APPEARANCES.index(example["table_appearance"])] += 1
+                if use_fp8_opt:
+                    ft = batch["fast_tensors"]
+                    if "appearance_counts_t" not in locals():
+                        appearance_counts_t = torch.zeros(len(TABLE_APPEARANCES), dtype=torch.long, device=accelerator.device)
+                    if "table_appearance_hist" in ft:
+                        appearance_counts_t.add_(ft["table_appearance_hist"])
+                else:
+                    for example in batch["examples"]:
+                        appearance_counts[TABLE_APPEARANCES.index(example["table_appearance"])] += 1
             is_sync_step = (
                 bool(args.smoke_steps)
                 or step == 1
@@ -361,16 +436,18 @@ def main():
                 assert np.isfinite(record["grad_norm"]), record
                 if cfg.datasets.vla_data.get('history_frames', 0):
                     if step == 1 or step % cfg.trainer.logging_frequency == 0:
-                        counts = accelerator.reduce(torch.tensor(prompt_counts, device=accelerator.device), reduction='sum').cpu().tolist()
+                        src_counts = prompt_counts_t if use_fp8_opt else torch.tensor(prompt_counts, device=accelerator.device)
+                        counts = accelerator.reduce(src_counts, reduction='sum').cpu().tolist()
                         record.update({f'prompt/{name}_fraction':count/sum(counts) for name,count in zip(names,counts)})
                 if table_appearance is not None:
                     if step == 1 or step % cfg.trainer.logging_frequency == 0:
-                        counts = accelerator.reduce(torch.tensor(appearance_counts, device=accelerator.device),
-                                                    reduction="sum").cpu().tolist()
-                        record.update({
-                            f"table_appearance/{name}_fraction": count / sum(counts)
-                            for name, count in zip(TABLE_APPEARANCES, counts, strict=True)
-                        })
+                        src_ta = appearance_counts_t if use_fp8_opt else torch.tensor(appearance_counts, device=accelerator.device)
+                        counts = accelerator.reduce(src_ta, reduction="sum").cpu().tolist()
+                        if sum(counts) > 0:
+                            record.update({
+                                f"table_appearance/{name}_fraction": count / sum(counts)
+                                for name, count in zip(TABLE_APPEARANCES, counts, strict=True)
+                            })
                 records.append(record)
                 if accelerator.is_main_process:
                     print(json.dumps(record), flush=True)
@@ -405,11 +482,18 @@ def main():
         (out / "profile-scopes.json").write_text(json.dumps(summary, indent=2))
     if args.smoke_steps:
         bare = accelerator.unwrap_model(model)
-        bare.eval()
-        predicted = bare.predict_action(batch)["normalized_actions"]
-        assert predicted.shape == (args.batch_size, 50, 114) and np.isfinite(predicted).all()
-        report = {"status": "PASS", "rank": accelerator.process_index, "steps": step,
-                  "prediction_shape": list(predicted.shape), "records": records}
+        if use_fp8_opt:
+            flush_pending_weight_gather(model)
+            sd = bare.state_dict()
+            assert len(sd) == 1256, f"Expected 1256 canonical keys, got {len(sd)}"
+            report = {"status": "PASS", "rank": accelerator.process_index, "steps": step,
+                      "canonical_keys": len(sd), "records": records}
+        else:
+            bare.eval()
+            predicted = bare.predict_action(batch)["normalized_actions"]
+            assert predicted.shape == (args.batch_size, 50, 114) and np.isfinite(predicted).all()
+            report = {"status": "PASS", "rank": accelerator.process_index, "steps": step,
+                      "prediction_shape": list(predicted.shape), "records": records}
         (out / f"smoke-rank-{accelerator.process_index:02d}.json").write_text(json.dumps(report, indent=2))
     if validation:
         log_validation(validation.close())

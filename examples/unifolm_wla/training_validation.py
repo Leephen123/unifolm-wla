@@ -54,8 +54,12 @@ class TrainingValidation:
         self.ao, self.asc = (np.asarray(stats["action"][k], dtype=np.float32) for k in ("offset", "scale"))
         self.prompt = read_json(cfg.datasets.vla_data.manifest_path)["prompt"]
         self.episodes = list(cfg.validation.episodes)
-        from examples.unifolm_wla.training_worker_inputs import CPUInputsCollator
-        collator = CPUInputsCollator(cfg)
+        if cfg.get("training_optimization") == "fp8_opt":
+            from examples.unifolm_wla.fp8_opt import FastWLAInputsCollator
+            collator = FastWLAInputsCollator(cfg, tight_seq=True, gpu_patch_unpack=True)
+        else:
+            from examples.unifolm_wla.training_worker_inputs import CPUInputsCollator
+            collator = CPUInputsCollator(cfg)
         self.prepared, self.examples, self.batches = {}, {}, {}
         self.inference_batches = {}
         self.runtime = None
@@ -146,28 +150,55 @@ class TrainingValidation:
         if accelerator.is_main_process:
             folder.mkdir(exist_ok=False)
         accelerator.wait_for_everyone()
+        use_fp8_opt = getattr(bare, "_has_zero_sync_fwd", False)
+        if use_fp8_opt:
+            from examples.unifolm_wla.fp8_opt import clear_all_fp8_weights, flush_pending_weight_gather
+            from examples.unifolm_wla.fp8_opt.cuda_ops import get_pool
+            flush_pending_weight_gather(model)
         started = time.perf_counter()
         raw = {}
         with validation_state(bare, accelerator.device):
-            if self.runtime is not None:
-                self.runtime.refresh(bare)
-            for eid, examples in self.examples.items():
-                predictions, losses = [], []
-                for start in range(0, len(examples), self.batch_size):
-                    from accelerate.utils import send_to_device
-                    batch = send_to_device(self.batches[eid][start // self.batch_size], accelerator.device)
-                    batch_count = len(batch["examples"])
-                    seed = int(self.cfg.validation.seed) + eid * 100000 + start
-                    torch.random.default_generator.manual_seed(seed)
-                    torch.cuda.manual_seed(seed)
-                    with torch.compiler.set_stance("force_eager"), accelerator.autocast():
-                        loss = bare(batch)["action_loss"]
-                    # Separate loss draws from open-loop noise; both repeat across checkpoints.
-                    torch.cuda.manual_seed(seed + 1)
-                    predicted = self.runtime.infer(*self.inference_batches[eid][start // self.batch_size])[:batch_count]
-                    losses.append((loss.detach().float().cpu().item(), batch_count))
-                    predictions.append(predicted)
-                raw[eid] = (predictions, losses)
+            saved_pool_state = None
+            if use_fp8_opt:
+                pool = get_pool(accelerator.device)
+                saved_pool_state = (
+                    pool.next_amax_i32.clone(),
+                    pool.curr_scale.clone(),
+                    pool.curr_inv_scale.clone(),
+                    int(pool.step_count),
+                )
+            try:
+                if self.runtime is not None:
+                    self.runtime.refresh(bare)
+                if use_fp8_opt:
+                    for _m in getattr(bare, "_fp8_opt_modules", ()):
+                        _m.cache_step_weight()
+                for eid, examples in self.examples.items():
+                    predictions, losses = [], []
+                    for start in range(0, len(examples), self.batch_size):
+                        from accelerate.utils import send_to_device
+                        batch = send_to_device(self.batches[eid][start // self.batch_size], accelerator.device)
+                        batch_count = int(batch["batch_size"]) if "batch_size" in batch else len(batch["examples"])
+                        seed = int(self.cfg.validation.seed) + eid * 100000 + start
+                        torch.random.default_generator.manual_seed(seed)
+                        torch.cuda.manual_seed(seed)
+                        with torch.compiler.set_stance("force_eager"), accelerator.autocast():
+                            loss = bare(batch)["action_loss"]
+                        # Separate loss draws from open-loop noise; both repeat across checkpoints.
+                        torch.cuda.manual_seed(seed + 1)
+                        predicted = self.runtime.infer(*self.inference_batches[eid][start // self.batch_size])[:batch_count]
+                        losses.append((loss.detach().float().cpu().item(), batch_count))
+                        predictions.append(predicted)
+                    raw[eid] = (predictions, losses)
+            finally:
+                if use_fp8_opt:
+                    clear_all_fp8_weights(bare)
+                    if saved_pool_state is not None:
+                        pool = get_pool(accelerator.device)
+                        pool.next_amax_i32.copy_(saved_pool_state[0])
+                        pool.curr_scale.copy_(saved_pool_state[1])
+                        pool.curr_inv_scale.copy_(saved_pool_state[2])
+                        pool.step_count = saved_pool_state[3]
         torch.cuda.synchronize(accelerator.device)
         accelerator.wait_for_everyone()
         gpu_seconds = time.perf_counter() - started
